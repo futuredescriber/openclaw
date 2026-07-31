@@ -447,8 +447,8 @@ function cloneSqliteCheckpointSessionEntry(params: {
       : undefined,
   };
   // JSON serialization matches the persisted blob by dropping undefined and symbol projections.
-  // oxlint-disable-next-line unicorn/prefer-structured-clone
-  return projectCanonicalSessionEntryShape(JSON.parse(JSON.stringify(entry)));
+  const serializedEntry = JSON.stringify(entry);
+  return projectCanonicalSessionEntryShape(JSON.parse(serializedEntry));
 }
 
 function readTranscriptHeaderCwd(events: readonly TranscriptEvent[]): string | undefined {

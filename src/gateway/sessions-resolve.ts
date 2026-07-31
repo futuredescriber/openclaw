@@ -123,7 +123,10 @@ function assertCanonicalResolveMatches(
   matches: readonly [string, SessionEntry][],
 ): void {
   const canonicalKeys = new Set<string>();
-  for (const [sessionKey] of matches) {
+  for (const [sessionKey, entry] of matches) {
+    if (resolveDeletedAgentIdFromSessionKey(cfg, sessionKey, entry) !== null) {
+      continue;
+    }
     const canonicalKey = resolveSessionStoreKey({ cfg, sessionKey });
     if (canonicalKey !== sessionKey || canonicalKeys.has(canonicalKey)) {
       throw canonicalSessionKeyMigrationRequiredError(

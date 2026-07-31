@@ -200,7 +200,6 @@ export function assertCanonicalSqliteSessionKeysCurrent(
       row.session_key !== trimmed ||
       normalizeStoreSessionKey(trimmed) !== trimmed ||
       (!parsed && trimmed !== "global" && trimmed !== "unknown") ||
-      (parsed && parsed.agentId !== normalizeAgentId(database.agentId)) ||
       (parsed && parsed.rest === "main" && canonicalMainKey !== "main")
     ) {
       throw canonicalSessionKeyMigrationRequiredError(
