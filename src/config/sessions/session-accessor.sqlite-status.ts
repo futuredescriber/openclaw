@@ -192,7 +192,7 @@ export function querySqliteSessionEntries(
   if (!readSqliteTableColumns(database.db, "session_nodes")?.has("entry_valid")) {
     throw new SessionEntryValidityMigrationRequiredError();
   }
-  assertCanonicalSqliteSessionKeysCurrent(database, query.mainKey);
+  assertCanonicalSqliteSessionKeysCurrent(database, query.mainKey, { allowPending: true });
   const included = query.includeLineageSessionKeys;
   if (included && included.length > 400) {
     throw new Error("session list lineage inclusions exceed the SQLite parameter bound");
