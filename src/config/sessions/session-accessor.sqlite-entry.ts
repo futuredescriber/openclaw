@@ -293,6 +293,7 @@ export function querySqliteSessionEntries(
   const resolved = resolveSqliteScope({ ...scope, sessionKey: "" });
   const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
   return querySqliteSessionEntriesFromDatabase(database, scope.query, {
+    ...(resolved.databaseAgentId ? {} : { expectedAgentId: resolved.agentId }),
     projection: scope.projection,
     setProjectedTitle: setSessionProjectedTitle,
   });
@@ -306,6 +307,7 @@ export function querySqliteSessionEntriesReadOnly(
   const result = withOpenClawAgentDatabaseReadOnly(
     (database) =>
       querySqliteSessionEntriesFromDatabase(database, scope.query, {
+        ...(resolved.databaseAgentId ? {} : { expectedAgentId: resolved.agentId }),
         projection: scope.projection,
         setProjectedTitle: setSessionProjectedTitle,
       }),

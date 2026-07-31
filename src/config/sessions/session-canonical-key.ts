@@ -118,7 +118,7 @@ export function canonicalSessionKeyMigrationRequiredError(
 export function assertCanonicalSqliteSessionKeysCurrent(
   database: { agentId: string; db: DatabaseSync },
   mainKey?: string,
-  options: { allowPending?: boolean } = {},
+  options: { allowPending?: boolean; expectedAgentId?: string } = {},
 ): void {
   if (validatedDatabases.has(database.db)) {
     return;
@@ -131,6 +131,9 @@ export function assertCanonicalSqliteSessionKeysCurrent(
     db.selectFrom("session_key_contract").select("main_key").where("id", "=", 1),
   )?.main_key;
   const canonicalMainKey = normalizeMainKey(mainKey ?? storedMainKey);
+  const expectedAgentId = options.expectedAgentId
+    ? normalizeAgentId(options.expectedAgentId)
+    : undefined;
   let sawPending = false;
   for (const row of executeSqliteQuerySync(
     database.db,
@@ -200,6 +203,7 @@ export function assertCanonicalSqliteSessionKeysCurrent(
       row.session_key !== trimmed ||
       normalizeStoreSessionKey(trimmed) !== trimmed ||
       (!parsed && trimmed !== "global" && trimmed !== "unknown") ||
+      (parsed && expectedAgentId && parsed.agentId !== expectedAgentId) ||
       (parsed && parsed.rest === "main" && canonicalMainKey !== "main")
     ) {
       throw canonicalSessionKeyMigrationRequiredError(

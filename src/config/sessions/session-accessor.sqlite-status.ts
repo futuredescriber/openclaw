@@ -185,6 +185,7 @@ export function querySqliteSessionEntries(
   database: SessionDatabaseReader,
   query: SessionEntryListQuery,
   options: {
+    expectedAgentId?: string;
     projection?: "full" | "list";
     setProjectedTitle: (entry: SessionEntry, title: string | null) => void;
   },
@@ -192,7 +193,10 @@ export function querySqliteSessionEntries(
   if (!readSqliteTableColumns(database.db, "session_nodes")?.has("entry_valid")) {
     throw new SessionEntryValidityMigrationRequiredError();
   }
-  assertCanonicalSqliteSessionKeysCurrent(database, query.mainKey, { allowPending: true });
+  assertCanonicalSqliteSessionKeysCurrent(database, query.mainKey, {
+    allowPending: true,
+    ...(options.expectedAgentId ? { expectedAgentId: options.expectedAgentId } : {}),
+  });
   const included = query.includeLineageSessionKeys;
   if (included && included.length > 400) {
     throw new Error("session list lineage inclusions exceed the SQLite parameter bound");

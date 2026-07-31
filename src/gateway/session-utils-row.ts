@@ -328,16 +328,14 @@ export function buildGatewaySessionRow(params: {
     agentId: sessionAgentId,
     sessionKey: key,
   });
-  const estimatedCostUsd = lightweight
-    ? (resolveNonNegativeNumber(entry?.estimatedCostUsd) ??
-      resolveNonNegativeNumber(transcriptUsage?.estimatedCostUsd))
-    : (resolveEstimatedSessionCostUsd({
-        cfg,
-        provider: rowModelProvider,
-        model: rowModel,
-        entry,
-        rowContext: params.rowContext,
-      }) ?? resolveNonNegativeNumber(transcriptUsage?.estimatedCostUsd));
+  const estimatedCostUsd =
+    resolveEstimatedSessionCostUsd({
+      cfg,
+      provider: rowModelProvider,
+      model: rowModel,
+      entry,
+      rowContext: params.rowContext,
+    }) ?? resolveNonNegativeNumber(transcriptUsage?.estimatedCostUsd);
   const contextTokens = lightweight
     ? (resolvePositiveNumber(entry?.contextTokens) ??
       resolvePositiveNumber(
