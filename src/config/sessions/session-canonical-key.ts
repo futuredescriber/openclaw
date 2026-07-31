@@ -157,6 +157,10 @@ export function assertCanonicalSqliteSessionKeysCurrent(
     ) {
       continue;
     }
+    if (row.entry_valid === 0) {
+      // Mixed-version writers may leave a row pending; indexed reads exclude it until doctor.
+      continue;
+    }
     if (row.entry_valid !== 1) {
       throw canonicalSessionKeyMigrationRequiredError(
         `invalid persisted session row requires repair for ${row.session_key}`,
@@ -191,6 +195,7 @@ export function assertCanonicalSqliteSessionKeysCurrent(
       row.session_key !== trimmed ||
       normalizeStoreSessionKey(trimmed) !== trimmed ||
       (!parsed && trimmed !== "global" && trimmed !== "unknown") ||
+      (parsed && parsed.agentId !== normalizeAgentId(database.agentId)) ||
       (parsed && parsed.rest === "main" && canonicalMainKey !== "main")
     ) {
       throw canonicalSessionKeyMigrationRequiredError(
