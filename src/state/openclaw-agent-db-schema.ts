@@ -5,7 +5,7 @@ import {
   hasLegacyMemoryRecallMetadataColumns,
   migrateMemoryIndexSourcesIdentity,
 } from "../../packages/memory-host-sdk/src/host/memory-schema.js";
-import { deriveSqliteSessionTitle } from "../config/sessions/session-accessor.sqlite-session-row.js";
+import { deriveSqliteSessionTitle } from "../config/sessions/session-title-projection.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import {

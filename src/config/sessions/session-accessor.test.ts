@@ -64,7 +64,6 @@ import {
   readSqliteSessionEntryKeys,
 } from "./session-accessor.sqlite-entry-store.js";
 import { querySqliteSessionEntriesReadOnly } from "./session-accessor.sqlite-entry.js";
-import { getSessionProjectedTitle } from "./session-accessor.sqlite-session-row.js";
 import { querySqliteSessionEntries } from "./session-accessor.sqlite-status.js";
 import {
   applySqliteSessionEntryLifecycleMutation,
@@ -77,6 +76,7 @@ import {
   trimSqliteTranscriptForManualCompact,
 } from "./session-accessor.sqlite.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
+import { getSessionProjectedTitle } from "./session-title-projection.js";
 import { withOwnedSessionTranscriptWrites } from "./transcript-write-context.js";
 import type { InternalSessionEntry, SessionEntry } from "./types.js";
 

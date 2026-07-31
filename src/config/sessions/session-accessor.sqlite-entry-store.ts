@@ -31,7 +31,6 @@ import {
   bindSqliteSessionRoot,
   normalizeSqliteSessionEntryTimestamp,
   resolveSqliteSessionTitleProjection,
-  setSessionProjectedTitle,
 } from "./session-accessor.sqlite-session-row.js";
 import {
   hasValidSqliteSessionEntryIdentity,
@@ -45,6 +44,7 @@ import {
   canonicalSessionKeyMigrationRequiredError,
 } from "./session-canonical-key.js";
 import { parseSqliteSessionEntryRecord, sqliteSessionEntriesEqual } from "./session-entry-json.js";
+import { setSessionProjectedTitle } from "./session-title-projection.js";
 import { projectCanonicalSessionEntryShape } from "./store-entry-shape.js";
 import {
   collectSessionEntryLookupKeys,

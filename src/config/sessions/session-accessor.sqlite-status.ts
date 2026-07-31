@@ -1,3 +1,4 @@
+import type { DatabaseSync } from "node:sqlite";
 import type { Expression, ExpressionBuilder, SqlBool } from "kysely";
 import {
   executeSqliteQuerySync,
@@ -6,7 +7,6 @@ import {
 } from "../../infra/kysely-sync.js";
 import { readSqliteTableColumns } from "../../state/openclaw-agent-db-session-migrations.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
-import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import type {
   SessionEntryStatus,
   SessionEntrySummary,
@@ -22,7 +22,7 @@ import type { SessionEntry } from "./types.js";
 
 type SessionStatusDatabase = Pick<OpenClawAgentKyselyDatabase, "session_nodes">;
 type SessionListExpressionBuilder = ExpressionBuilder<SessionStatusDatabase, "session_nodes">;
-type SessionDatabaseReader = Pick<OpenClawAgentDatabase, "agentId" | "db">;
+type SessionDatabaseReader = { agentId: string; db: DatabaseSync };
 const SESSION_ENTRY_VALIDITY_REPAIR_COMMAND = "openclaw doctor --fix";
 
 class SessionEntryValidityMigrationRequiredError extends Error {

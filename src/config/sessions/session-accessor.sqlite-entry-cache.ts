@@ -5,8 +5,8 @@ import {
   type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
-import { setSessionProjectedTitle } from "./session-accessor.sqlite-session-row.js";
 import { parseSqliteSessionEntryJson } from "./session-accessor.sqlite-status.js";
+import { setSessionProjectedTitle } from "./session-title-projection.js";
 import type { SessionEntry } from "./types.js";
 
 type SessionEntryCacheDatabase = Pick<OpenClawAgentDatabase, "agentId" | "db">;

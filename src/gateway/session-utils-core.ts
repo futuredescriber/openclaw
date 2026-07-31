@@ -10,7 +10,7 @@ import {
   shouldKeepSubagentRunChildLink,
 } from "../agents/subagent-run-liveness.js";
 import { isTerminalSessionStatus, type SessionEntry } from "../config/sessions.js";
-export { deriveSessionTitle } from "../config/sessions/session-accessor.sqlite-session-row.js";
+export { deriveSessionTitle } from "../config/sessions/session-title-projection.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveNonNegativeNumber } from "../shared/number-coercion.js";
 import {

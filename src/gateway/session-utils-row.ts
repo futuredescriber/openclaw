@@ -21,8 +21,8 @@ import {
   resolveSessionGoalDisplayState,
   type SessionEntry,
 } from "../config/sessions.js";
-import { getSessionProjectedTitle } from "../config/sessions/session-accessor.sqlite-session-row.js";
 import { sessionEntryForkedFromParent } from "../config/sessions/session-entry-lineage.js";
+import { getSessionProjectedTitle } from "../config/sessions/session-title-projection.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { projectPluginSessionExtensionsSync } from "../plugins/host-hook-state.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";

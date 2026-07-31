@@ -63,7 +63,6 @@ import {
   toDatabaseOptions,
   type ResolvedSqliteScope,
 } from "./session-accessor.sqlite-scope.js";
-import { setSessionProjectedTitle } from "./session-accessor.sqlite-session-row.js";
 import {
   querySqliteSessionEntries as querySqliteSessionEntriesFromDatabase,
   readSqliteSessionEntriesByStatus,
@@ -79,6 +78,7 @@ import { preserveSqliteSameKeySessionRolloverLineage } from "./session-entry-lin
 import { buildSessionCreationStamp } from "./session-entry-provenance.js";
 import { kickSessionHistoryDiskBudgetMaintenance } from "./session-history-eviction.js";
 import { resolveSessionStorePathForScope } from "./session-store-path.js";
+import { setSessionProjectedTitle } from "./session-title-projection.js";
 import { resolveDeliveryProvenCanonicalSessionKey } from "./store-entry.js";
 import type { GroupKeyResolution, SessionEntry } from "./types.js";
 import { mergeSessionEntry, mergeSessionEntryPreserveActivity } from "./types.js";

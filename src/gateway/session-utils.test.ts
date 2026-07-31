@@ -14,8 +14,8 @@ import {
   listSessionEntriesReadOnly,
   replaceSessionEntry,
 } from "../config/sessions/session-accessor.js";
-import { setSessionProjectedTitle } from "../config/sessions/session-accessor.sqlite-session-row.js";
 import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
+import { setSessionProjectedTitle } from "../config/sessions/session-title-projection.js";
 import type { CronJob } from "../cron/types.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
