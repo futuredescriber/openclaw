@@ -44,6 +44,7 @@ import { createSessionEventRefreshCoordinator } from "./event-refresh-coordinato
 import { scopedAgentListParamsForSession, type SessionArchivedFilter } from "./navigation.ts";
 import type { SessionPatch, SessionPatchOptions, SessionPatchRoute } from "./patch.ts";
 import {
+  appendSessionResults,
   readSessionChangedEvent,
   reconcileSessionChanged,
   reconcileSessionHistory,
@@ -333,30 +334,6 @@ const SESSION_LIST_PARAMS = {
   configuredAgentsOnly: true,
 } as const;
 
-function buildSessionRequestParams(
-  key: string,
-  agentId?: string | null,
-): { key: string; agentId?: string } {
-  const normalizedKey = key.trim();
-  const normalizedAgentId = agentId?.trim();
-  return {
-    key: normalizedKey,
-    ...(normalizedAgentId ? { agentId: normalizedAgentId } : {}),
-  };
-}
-
-function buildTranscriptMutationParams(
-  sessionKey: string,
-  agentId?: string | null,
-): { sessionKey: string; agentId?: string } {
-  const normalizedSessionKey = sessionKey.trim();
-  const normalizedAgentId = agentId?.trim();
-  return {
-    sessionKey: normalizedSessionKey,
-    ...(normalizedAgentId ? { agentId: normalizedAgentId } : {}),
-  };
-}
-
 function buildSessionListParams(options: SessionListOptions = {}): Record<string, unknown> {
   const params: Record<string, unknown> = {
     ...SESSION_LIST_PARAMS,
@@ -366,14 +343,10 @@ function buildSessionListParams(options: SessionListOptions = {}): Record<string
   } else if (options.limit > 0) {
     params.limit = Math.floor(options.limit);
   }
-  if (options.includeGlobal !== undefined) {
-    params.includeGlobal = options.includeGlobal;
-  }
-  if (options.includeUnknown !== undefined) {
-    params.includeUnknown = options.includeUnknown;
-  }
-  if (options.configuredAgentsOnly !== undefined) {
-    params.configuredAgentsOnly = options.configuredAgentsOnly;
+  for (const field of ["includeGlobal", "includeUnknown", "configuredAgentsOnly"] as const) {
+    if (options[field] !== undefined) {
+      params[field] = options[field];
+    }
   }
   if (options.includeDerivedTitles === true) {
     params.includeDerivedTitles = true;
@@ -392,24 +365,14 @@ function buildSessionListParams(options: SessionListOptions = {}): Record<string
   if (activeMinutes > 0) {
     params.activeMinutes = activeMinutes;
   }
-  const agentId = options.agentId?.trim();
-  const spawnedBy = options.spawnedBy?.trim();
-  const search = options.search?.trim();
-  const creatorId = options.creatorId?.trim();
   if (options.boardFace) {
     params.boardFace = options.boardFace;
   }
-  if (agentId) {
-    params.agentId = agentId;
-  }
-  if (spawnedBy) {
-    params.spawnedBy = spawnedBy;
-  }
-  if (search) {
-    params.search = search;
-  }
-  if (creatorId) {
-    params.creatorId = creatorId;
+  for (const field of ["agentId", "spawnedBy", "search", "creatorId"] as const) {
+    const value = options[field]?.trim();
+    if (value) {
+      params[field] = value;
+    }
   }
   if (typeof options.offset === "number" && options.offset > 0) {
     params.offset = Math.floor(options.offset);
@@ -428,15 +391,34 @@ async function requestSessionList(
   return result ?? null;
 }
 
-function requestSessionPatch(
+function requestSessionOperation<T>(
   client: SessionRequestClient,
+  method: string,
   key: string,
-  patch: SessionPatch,
   options: { agentId?: string | null } = {},
-): Promise<SessionsPatchResult> {
-  return client.request<SessionsPatchResult>("sessions.patch", {
-    ...buildSessionRequestParams(key, options.agentId),
-    ...patch,
+  params: Record<string, unknown> = {},
+  keyField: "key" | "sessionKey" = "key",
+): Promise<T> {
+  const agentId = options.agentId?.trim();
+  return client.request<T>(method, {
+    [keyField]: key.trim(),
+    ...(agentId ? { agentId } : {}),
+    ...params,
+  });
+}
+
+function requestSessionWorkspaceOperation<T>(
+  client: SessionRequestClient,
+  method: string,
+  key: string,
+  options: { agentId?: string | null },
+  params: Record<string, unknown>,
+): Promise<T> {
+  const agentId = options.agentId?.trim();
+  return client.request<T>(method, {
+    sessionKey: key,
+    ...params,
+    ...(agentId ? { agentId } : {}),
   });
 }
 
@@ -445,8 +427,7 @@ function requestSessionDelete(
   key: string,
   options: SessionDeleteOptions = {},
 ): Promise<SessionDeleteResponse> {
-  return client.request<SessionDeleteResponse>("sessions.delete", {
-    ...buildSessionRequestParams(key, options.agentId),
+  return requestSessionOperation<SessionDeleteResponse>(client, "sessions.delete", key, options, {
     deleteTranscript: options.deleteTranscript ?? true,
     ...(options.archivedOnly === true ? { archivedOnly: true } : {}),
   });
@@ -456,192 +437,6 @@ function confirmsSessionDeletion(response: SessionDeleteResponse): boolean {
   // A successful RPC can still be a lifecycle no-op. Only the canonical result
   // may drive optimistic removal, navigation, and model-override cleanup.
   return response.deleted;
-}
-
-function requestSessionReset(
-  client: SessionRequestClient,
-  key: string,
-  options: SessionResetOptions = {},
-): Promise<void> {
-  return client
-    .request("sessions.reset", {
-      ...buildSessionRequestParams(key, options.agentId),
-    })
-    .then(() => undefined);
-}
-
-function requestSessionCompact(
-  client: SessionRequestClient,
-  key: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionCompactResult> {
-  return client.request<SessionCompactResult>("sessions.compact", {
-    ...buildSessionRequestParams(key, options.agentId),
-  });
-}
-
-function requestSessionSteer(
-  client: SessionRequestClient,
-  key: string,
-  message: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionSteerResult> {
-  return client.request<SessionSteerResult>("sessions.steer", {
-    ...buildSessionRequestParams(key, options.agentId),
-    message,
-  });
-}
-
-function requestSessionFilesList(
-  client: SessionRequestClient,
-  key: string,
-  options: { agentId?: string | null; path?: string; search?: string } = {},
-): Promise<SessionWorkspaceListResult | null> {
-  return client.request<SessionWorkspaceListResult | null>("sessions.files.list", {
-    sessionKey: key,
-    path: options.path ?? "",
-    search: options.search ?? "",
-    ...(options.agentId?.trim() ? { agentId: options.agentId.trim() } : {}),
-  });
-}
-
-function requestSessionFile(
-  client: SessionRequestClient,
-  key: string,
-  path: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionWorkspaceGetResult | null> {
-  return client.request<SessionWorkspaceGetResult | null>("sessions.files.get", {
-    sessionKey: key,
-    path,
-    ...(options.agentId?.trim() ? { agentId: options.agentId.trim() } : {}),
-  });
-}
-
-function requestSessionFileSet(
-  client: SessionRequestClient,
-  key: string,
-  path: string,
-  content: string,
-  options: { agentId?: string | null; expectedHash: string },
-): Promise<SessionWorkspaceSetResult | null> {
-  return client.request<SessionWorkspaceSetResult | null>("sessions.files.set", {
-    sessionKey: key,
-    path,
-    content,
-    expectedHash: options.expectedHash,
-    ...(options.agentId?.trim() ? { agentId: options.agentId.trim() } : {}),
-  });
-}
-
-async function listSessionCheckpoints(
-  client: SessionRequestClient,
-  key: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionsCompactionListResult> {
-  return client.request<SessionsCompactionListResult>(
-    "sessions.compaction.list",
-    buildSessionRequestParams(key, options.agentId),
-  );
-}
-
-function branchSessionCheckpoint(
-  client: SessionRequestClient,
-  key: string,
-  checkpointId: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionsCompactionBranchResult> {
-  return client.request<SessionsCompactionBranchResult>("sessions.compaction.branch", {
-    ...buildSessionRequestParams(key, options.agentId),
-    checkpointId,
-  });
-}
-
-function restoreSessionCheckpoint(
-  client: SessionRequestClient,
-  key: string,
-  checkpointId: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionsCompactionRestoreResult> {
-  return client.request<SessionsCompactionRestoreResult>("sessions.compaction.restore", {
-    ...buildSessionRequestParams(key, options.agentId),
-    checkpointId,
-  });
-}
-
-function rewindSessionAtMessage(
-  client: SessionRequestClient,
-  key: string,
-  entryId: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionsRewindResult> {
-  return client.request<SessionsRewindResult>("sessions.rewind", {
-    ...buildTranscriptMutationParams(key, options.agentId),
-    entryId,
-  });
-}
-
-function forkSessionAtMessage(
-  client: SessionRequestClient,
-  key: string,
-  entryId: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionsForkResult> {
-  return client.request<SessionsForkResult>("sessions.fork", {
-    ...buildTranscriptMutationParams(key, options.agentId),
-    entryId,
-  });
-}
-
-function listSessionBranches(
-  client: SessionRequestClient,
-  key: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionsBranchesListResult> {
-  return client.request<SessionsBranchesListResult>(
-    "sessions.branches.list",
-    buildTranscriptMutationParams(key, options.agentId),
-  );
-}
-
-function switchSessionBranch(
-  client: SessionRequestClient,
-  key: string,
-  leafEntryId: string,
-  options: { agentId?: string | null } = {},
-): Promise<SessionsBranchesSwitchResult> {
-  return client.request<SessionsBranchesSwitchResult>("sessions.branches.switch", {
-    ...buildTranscriptMutationParams(key, options.agentId),
-    leafEntryId,
-  });
-}
-
-function appendSessionResults(
-  previous: SessionsListResult,
-  page: SessionsListResult,
-): SessionsListResult {
-  const seen = new Set<string>();
-  const sessions = [...previous.sessions, ...page.sessions].filter((row) => {
-    if (!row.key || seen.has(row.key)) {
-      return false;
-    }
-    seen.add(row.key);
-    return true;
-  });
-  const totalCount = page.totalCount ?? previous.totalCount;
-  const hasMore =
-    page.hasMore ??
-    (typeof totalCount === "number" && Number.isFinite(totalCount)
-      ? sessions.length < totalCount
-      : false);
-  return {
-    ...page,
-    count: sessions.length,
-    totalCount,
-    hasMore,
-    nextOffset: page.nextOffset ?? (hasMore ? sessions.length : null),
-    sessions,
-  };
 }
 
 function isSessionStateEvent(event: GatewayEventFrame): boolean {
@@ -768,15 +563,25 @@ export function createSessionCapability(gateway: SessionGateway): SessionCapabil
     );
   };
 
+  const requestCurrentConnection = async <T>(
+    fallback: T,
+    request: (client: GatewayBrowserClient) => Promise<T>,
+  ): Promise<T> => {
+    const scope = captureConnection();
+    if (!scope) {
+      return fallback;
+    }
+    const result = await request(scope.client);
+    return isCurrentConnection(scope) ? result : fallback;
+  };
+
   const requestList = async (
     options: SessionListOptions = {},
   ): Promise<SessionsListResult | null> => {
-    const scope = captureConnection();
-    if (!scope) {
-      return null;
-    }
-    const result = await requestSessionList(scope.client, options);
-    return isCurrentConnection(scope) ? swarmActivity.decorate(result ?? null) : null;
+    const result = await requestCurrentConnection<SessionsListResult | null>(null, (client) =>
+      requestSessionList(client, options),
+    );
+    return swarmActivity.decorate(result);
   };
 
   const publish = (next: SessionState, errorSource?: "session-observer" | "operation") => {
@@ -1253,17 +1058,6 @@ export function createSessionCapability(gateway: SessionGateway): SessionCapabil
     publish({ ...state, groups: [...groups], sectionOrder: [...sectionOrder] });
   };
 
-  const finishGroupMutationFailure = (
-    current: boolean,
-    error: unknown,
-  ): SessionGroupMutationResult => {
-    if (!current) {
-      return "stale";
-    }
-    publish({ ...state, error: String(error) }, "operation");
-    throw error;
-  };
-
   const readLegacyStoredGroups = (): string[] => {
     try {
       const raw = getSafeLocalStorage()?.getItem(LEGACY_GROUPS_STORAGE_KEY);
@@ -1355,68 +1149,50 @@ export function createSessionCapability(gateway: SessionGateway): SessionCapabil
     await loadGroups(scope, generation, advertised);
   };
 
-  const groupsPut = async (
-    names: readonly string[],
-    sectionOrder?: readonly string[],
+  const mutateGroups = async (
+    method: "sessions.groups.put" | "sessions.groups.rename" | "sessions.groups.delete",
+    params: Record<string, unknown>,
+    refreshMembers = false,
   ): Promise<SessionGroupMutationResult> => {
     const scope = captureConnection();
     if (!scope) {
       return "stale";
     }
     try {
-      const result = await scope.client.request("sessions.groups.put", {
-        names: [...names],
-        ...(sectionOrder === undefined ? {} : { sectionOrder: [...sectionOrder] }),
-      });
+      const result = await scope.client.request(method, params);
       if (!isCurrentConnection(scope)) {
         return "stale";
       }
       publishGroupCatalog(readSessionCustomGroupNames(result), readSidebarSectionOrder(result));
+      if (refreshMembers) {
+        // The mutation response commits membership; a later disconnect must
+        // not downgrade confirmed work while its background list reconciles.
+        void refresh({ ...lastListOptions, force: true });
+      }
       return "completed";
     } catch (error) {
-      return finishGroupMutationFailure(isCurrentConnection(scope), error);
+      if (!isCurrentConnection(scope)) {
+        return "stale";
+      }
+      publish({ ...state, error: String(error) }, "operation");
+      throw error;
     }
   };
 
-  const groupsRename = async (from: string, to: string): Promise<SessionGroupMutationResult> => {
-    const scope = captureConnection();
-    if (!scope) {
-      return "stale";
-    }
-    try {
-      const result = await scope.client.request("sessions.groups.rename", { name: from, to });
-      if (!isCurrentConnection(scope)) {
-        return "stale";
-      }
-      publishGroupCatalog(readSessionCustomGroupNames(result), readSidebarSectionOrder(result));
-      // The mutation response is the commit point. Reconcile member rows in
-      // the background so a later disconnect cannot downgrade confirmed work.
-      void refresh({ ...lastListOptions, force: true });
-      return "completed";
-    } catch (error) {
-      return finishGroupMutationFailure(isCurrentConnection(scope), error);
-    }
-  };
+  const groupsPut = (
+    names: readonly string[],
+    sectionOrder?: readonly string[],
+  ): Promise<SessionGroupMutationResult> =>
+    mutateGroups("sessions.groups.put", {
+      names: [...names],
+      ...(sectionOrder === undefined ? {} : { sectionOrder: [...sectionOrder] }),
+    });
 
-  const groupsDelete = async (name: string): Promise<SessionGroupMutationResult> => {
-    const scope = captureConnection();
-    if (!scope) {
-      return "stale";
-    }
-    try {
-      const result = await scope.client.request("sessions.groups.delete", { name });
-      if (!isCurrentConnection(scope)) {
-        return "stale";
-      }
-      publishGroupCatalog(readSessionCustomGroupNames(result), readSidebarSectionOrder(result));
-      // See groupsRename: collapsed-state consumers must observe confirmed
-      // completion before an unrelated refresh can outlive the connection.
-      void refresh({ ...lastListOptions, force: true });
-      return "completed";
-    } catch (error) {
-      return finishGroupMutationFailure(isCurrentConnection(scope), error);
-    }
-  };
+  const groupsRename = (from: string, to: string): Promise<SessionGroupMutationResult> =>
+    mutateGroups("sessions.groups.rename", { name: from, to }, true);
+
+  const groupsDelete = (name: string): Promise<SessionGroupMutationResult> =>
+    mutateGroups("sessions.groups.delete", { name }, true);
 
   const patch = async (
     key: string,
@@ -1456,7 +1232,13 @@ export function createSessionCapability(gateway: SessionGateway): SessionCapabil
           return null;
         }
       }
-      const result = await requestSessionPatch(scope.client, key, patchParams, options);
+      const result = await requestSessionOperation<SessionsPatchResult>(
+        scope.client,
+        "sessions.patch",
+        key,
+        options,
+        patchParams,
+      );
       if (!isCurrentConnection(scope)) {
         restoreModelOverride();
         return null;
@@ -1648,7 +1430,7 @@ export function createSessionCapability(gateway: SessionGateway): SessionCapabil
       return "not-started";
     }
     try {
-      await requestSessionReset(scope.client, key, options);
+      await requestSessionOperation(scope.client, "sessions.reset", key, options);
       return isCurrentConnection(scope) ? "completed" : "uncertain";
     } catch (error) {
       if (isCurrentConnection(scope)) {
@@ -1662,75 +1444,80 @@ export function createSessionCapability(gateway: SessionGateway): SessionCapabil
     }
   };
 
-  const compact = async (
-    key: string,
-    options: { agentId?: string | null } = {},
-  ): Promise<SessionCompactResult> => {
+  const requestRequiredSession = async <T>(
+    operation: string,
+    request: (client: GatewayBrowserClient) => Promise<T>,
+    refreshAgentId?: () => string | null | undefined,
+  ): Promise<T> => {
     const scope = captureConnection();
     if (!scope) {
-      throw new Error("Session compaction requires an active Gateway connection");
+      throw new Error(`Session ${operation} requires an active Gateway connection`);
     }
-    const result = await requestSessionCompact(scope.client, key, options);
+    const result = await request(scope.client);
     if (!isCurrentConnection(scope)) {
-      throw new Error("Session compaction completed on a replaced Gateway connection");
+      throw new Error(`Session ${operation} completed on a replaced Gateway connection`);
+    }
+    if (refreshAgentId) {
+      await refreshReplacement(refreshAgentId());
+      if (!isCurrentConnection(scope)) {
+        throw new Error(`Session ${operation} completed on a replaced Gateway connection`);
+      }
     }
     return result;
   };
 
-  const steer = async (
+  const compact = (
+    key: string,
+    options: { agentId?: string | null } = {},
+  ): Promise<SessionCompactResult> =>
+    requestRequiredSession("compaction", (client) =>
+      requestSessionOperation<SessionCompactResult>(client, "sessions.compact", key, options),
+    );
+
+  const steer = (
     key: string,
     message: string,
     options: { agentId?: string | null } = {},
-  ): Promise<SessionSteerResult> => {
-    const scope = captureConnection();
-    if (!scope) {
-      throw new Error("Session steering requires an active Gateway connection");
-    }
-    const result = await requestSessionSteer(scope.client, key, message, options);
-    if (!isCurrentConnection(scope)) {
-      throw new Error("Session steering completed on a replaced Gateway connection");
-    }
-    return result;
-  };
+  ): Promise<SessionSteerResult> =>
+    requestRequiredSession("steering", (client) =>
+      requestSessionOperation<SessionSteerResult>(client, "sessions.steer", key, options, {
+        message,
+      }),
+    );
 
-  const listFiles = async (
+  const listFiles = (
     key: string,
     options: { agentId?: string | null; path?: string; search?: string } = {},
-  ): Promise<SessionWorkspaceListResult | null> => {
-    const scope = captureConnection();
-    if (!scope) {
-      return null;
-    }
-    const result = await requestSessionFilesList(scope.client, key, options);
-    return isCurrentConnection(scope) ? result : null;
-  };
+  ): Promise<SessionWorkspaceListResult | null> =>
+    requestCurrentConnection<SessionWorkspaceListResult | null>(null, (client) =>
+      requestSessionWorkspaceOperation(client, "sessions.files.list", key, options, {
+        path: options.path ?? "",
+        search: options.search ?? "",
+      }),
+    );
 
-  const getFile = async (
+  const getFile = (
     key: string,
     path: string,
     options: { agentId?: string | null } = {},
-  ): Promise<SessionWorkspaceGetResult | null> => {
-    const scope = captureConnection();
-    if (!scope) {
-      return null;
-    }
-    const result = await requestSessionFile(scope.client, key, path, options);
-    return isCurrentConnection(scope) ? result : null;
-  };
+  ): Promise<SessionWorkspaceGetResult | null> =>
+    requestCurrentConnection<SessionWorkspaceGetResult | null>(null, (client) =>
+      requestSessionWorkspaceOperation(client, "sessions.files.get", key, options, { path }),
+    );
 
-  const setFile = async (
+  const setFile = (
     key: string,
     path: string,
     content: string,
     options: { agentId?: string | null; expectedHash: string },
-  ): Promise<SessionWorkspaceSetResult | null> => {
-    const scope = captureConnection();
-    if (!scope) {
-      return null;
-    }
-    const result = await requestSessionFileSet(scope.client, key, path, content, options);
-    return isCurrentConnection(scope) ? result : null;
-  };
+  ): Promise<SessionWorkspaceSetResult | null> =>
+    requestCurrentConnection<SessionWorkspaceSetResult | null>(null, (client) =>
+      requestSessionWorkspaceOperation(client, "sessions.files.set", key, options, {
+        path,
+        content,
+        expectedHash: options.expectedHash,
+      }),
+    );
 
   const unsubscribeMessages = async (subscription: SessionMessageSubscription): Promise<void> => {
     await releaseGatewaySessionMessageSubscription(subscription);
@@ -1764,117 +1551,117 @@ export function createSessionCapability(gateway: SessionGateway): SessionCapabil
     return subscription;
   };
 
-  const listCheckpoints = async (
+  const listCheckpoints = (
     key: string,
     options: { agentId?: string | null } = {},
-  ): Promise<SessionCompactionCheckpoint[]> => {
-    const scope = captureConnection();
-    if (!scope) {
-      return [];
-    }
-    const result = await listSessionCheckpoints(scope.client, key, options);
-    return isCurrentConnection(scope) ? (result.checkpoints ?? []) : [];
-  };
+  ): Promise<SessionCompactionCheckpoint[]> =>
+    requestCurrentConnection<SessionCompactionCheckpoint[]>([], async (client) => {
+      const result = await requestSessionOperation<SessionsCompactionListResult>(
+        client,
+        "sessions.compaction.list",
+        key,
+        options,
+      );
+      return result.checkpoints ?? [];
+    });
 
-  const branchCheckpoint = async (
+  const branchCheckpoint = (
     key: string,
     checkpointId: string,
     options: { agentId?: string | null } = {},
-  ): Promise<SessionsCompactionBranchResult> => {
-    const scope = captureConnection();
-    if (!scope) {
-      throw new Error("Session checkpoint operation requires an active Gateway connection");
-    }
-    const result = await branchSessionCheckpoint(scope.client, key, checkpointId, options);
-    if (!isCurrentConnection(scope)) {
-      throw new Error("Session checkpoint operation completed on a replaced Gateway connection");
-    }
-    await refreshReplacement(options.agentId ?? state.agentId ?? undefined);
-    if (!isCurrentConnection(scope)) {
-      throw new Error("Session checkpoint operation completed on a replaced Gateway connection");
-    }
-    return result;
-  };
+  ): Promise<SessionsCompactionBranchResult> =>
+    requestRequiredSession(
+      "checkpoint operation",
+      (client) =>
+        requestSessionOperation<SessionsCompactionBranchResult>(
+          client,
+          "sessions.compaction.branch",
+          key,
+          options,
+          { checkpointId },
+        ),
+      () => options.agentId ?? state.agentId,
+    );
 
-  const restoreCheckpoint = async (
+  const restoreCheckpoint = (
     key: string,
     checkpointId: string,
     options: { agentId?: string | null } = {},
-  ): Promise<SessionsCompactionRestoreResult> => {
-    const scope = captureConnection();
-    if (!scope) {
-      throw new Error("Session checkpoint operation requires an active Gateway connection");
-    }
-    const result = await restoreSessionCheckpoint(scope.client, key, checkpointId, options);
-    if (!isCurrentConnection(scope)) {
-      throw new Error("Session checkpoint operation completed on a replaced Gateway connection");
-    }
-    await refreshReplacement(options.agentId ?? state.agentId ?? undefined);
-    if (!isCurrentConnection(scope)) {
-      throw new Error("Session checkpoint operation completed on a replaced Gateway connection");
-    }
-    return result;
-  };
+  ): Promise<SessionsCompactionRestoreResult> =>
+    requestRequiredSession(
+      "checkpoint operation",
+      (client) =>
+        requestSessionOperation<SessionsCompactionRestoreResult>(
+          client,
+          "sessions.compaction.restore",
+          key,
+          options,
+          { checkpointId },
+        ),
+      () => options.agentId ?? state.agentId,
+    );
 
-  const rewind = async (
+  const mutateTranscript = async <T>(
+    operation: "rewind" | "fork" | "branch switch",
+    method: "sessions.rewind" | "sessions.fork" | "sessions.branches.switch",
     key: string,
-    entryId: string,
-    options: { agentId?: string | null } = {},
-  ): Promise<SessionsRewindResult> => {
+    params: Record<string, unknown>,
+    options: { agentId?: string | null },
+  ): Promise<T> => {
     const scope = captureConnection();
     if (!scope) {
-      throw new Error("Session rewind requires an active Gateway connection");
+      throw new Error(`Session ${operation} requires an active Gateway connection`);
     }
-    const result = await rewindSessionAtMessage(scope.client, key, entryId, options);
+    const result = await requestSessionOperation<T>(
+      scope.client,
+      method,
+      key,
+      options,
+      params,
+      "sessionKey",
+    );
     if (isCurrentConnection(scope)) {
       await refreshReplacement(options.agentId ?? state.agentId ?? undefined).catch(() => {});
     }
     return result;
   };
 
-  const forkAtMessage = async (
+  const rewind = (
     key: string,
     entryId: string,
     options: { agentId?: string | null } = {},
-  ): Promise<SessionsForkResult> => {
-    const scope = captureConnection();
-    if (!scope) {
-      throw new Error("Session fork requires an active Gateway connection");
-    }
-    const result = await forkSessionAtMessage(scope.client, key, entryId, options);
-    if (isCurrentConnection(scope)) {
-      await refreshReplacement(options.agentId ?? state.agentId ?? undefined).catch(() => {});
-    }
-    return result;
-  };
+  ): Promise<SessionsRewindResult> =>
+    mutateTranscript("rewind", "sessions.rewind", key, { entryId }, options);
 
-  const listBranches = async (
+  const forkAtMessage = (
+    key: string,
+    entryId: string,
+    options: { agentId?: string | null } = {},
+  ): Promise<SessionsForkResult> =>
+    mutateTranscript("fork", "sessions.fork", key, { entryId }, options);
+
+  const listBranches = (
     key: string,
     options: { agentId?: string | null } = {},
-  ): Promise<SessionBranch[]> => {
-    const scope = captureConnection();
-    if (!scope) {
-      return [];
-    }
-    const result = await listSessionBranches(scope.client, key, options);
-    return isCurrentConnection(scope) ? result.branches : [];
-  };
+  ): Promise<SessionBranch[]> =>
+    requestCurrentConnection<SessionBranch[]>([], async (client) => {
+      const result = await requestSessionOperation<SessionsBranchesListResult>(
+        client,
+        "sessions.branches.list",
+        key,
+        options,
+        {},
+        "sessionKey",
+      );
+      return result.branches;
+    });
 
-  const switchBranch = async (
+  const switchBranch = (
     key: string,
     leafEntryId: string,
     options: { agentId?: string | null } = {},
-  ): Promise<SessionsBranchesSwitchResult> => {
-    const scope = captureConnection();
-    if (!scope) {
-      throw new Error("Session branch switch requires an active Gateway connection");
-    }
-    const result = await switchSessionBranch(scope.client, key, leafEntryId, options);
-    if (isCurrentConnection(scope)) {
-      await refreshReplacement(options.agentId ?? state.agentId ?? undefined).catch(() => {});
-    }
-    return result;
-  };
+  ): Promise<SessionsBranchesSwitchResult> =>
+    mutateTranscript("branch switch", "sessions.branches.switch", key, { leafEntryId }, options);
 
   const stopGateway = gateway.subscribe((next) => {
     const previousClient = connectionClient;
