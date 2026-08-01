@@ -3,7 +3,7 @@ import { resolveGlobalSingleton } from "./global-singleton.js";
 
 export type PreparedEffectUse = {
   assertCurrent: () => void;
-  initiate: <T>(effect: () => T) => T;
+  initiate: <T>(effect: () => T, settlement?: Promise<unknown>) => T;
   release: () => void;
   persist: <T>(run: (assertCurrent: () => void) => Promise<T>) => Promise<T>;
 };
@@ -38,11 +38,11 @@ export async function withEffectPreparation<T>(
           assertOpen();
           use.assertCurrent();
         },
-        initiate(effect) {
+        initiate(effect, settlement) {
           return use.initiate(() => {
             assertOpen();
             return effect();
-          });
+          }, settlement);
         },
         release: () => use.release(),
         persist: (write) =>

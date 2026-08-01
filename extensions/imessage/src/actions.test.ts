@@ -119,6 +119,7 @@ describe("imessage message actions", () => {
         currentChannelId: "chat_guid:" + chatGuid,
       })?.actions,
     ).toStrictEqual([
+      "read",
       "react",
       "edit",
       "reply",

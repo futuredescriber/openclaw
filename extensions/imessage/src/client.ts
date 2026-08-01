@@ -321,7 +321,7 @@ export class IMessageRpcClient {
     } catch (err) {
       // Successful capability probes have no TTL; invalidate before recovery
       // so later actions cannot reuse the stalled bridge's available verdict.
-      if (isIMessageBridgeStall(err)) {
+      if (method !== "messages.history" && isIMessageBridgeStall(err)) {
         invalidateCachedIMessagePrivateApiStatus(this.configuredCliPath);
         try {
           await recoverIMessageBridge(this.configuredCliPath);

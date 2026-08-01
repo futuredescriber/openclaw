@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { expectDefined } from "@openclaw/normalization-core";
 import { toErrorObject } from "../infra/errors.js";
 import { getSpawnBroker } from "./spawn-broker/context.js";
-import { brokerSpawnOptions } from "./spawn-broker/host.js";
+import { brokerSpawnOptions } from "./spawn-broker/spawn-options.js";
 import { recordChildProcessSpawn } from "./spawn-diagnostics.js";
 import type { SpawnInitiation } from "./spawn-initiation.js";
 

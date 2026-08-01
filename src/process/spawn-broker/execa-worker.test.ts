@@ -1,11 +1,27 @@
 import { ChildProcess } from "node:child_process";
+import { Socket } from "node:net";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferredCore } from "../../shared/deferred.js";
+import type { createExecaOutput } from "./execa-output.js";
 import { restoreExecaResult } from "./execa-protocol.js";
 import { startBrokerExeca } from "./execa-worker.js";
 
-const boundary = vi.hoisted(() => ({ execa: vi.fn() }));
+const boundary = vi.hoisted(() => ({
+  execa: vi.fn(),
+  output: vi.fn<typeof createExecaOutput>(),
+  transfer: vi.fn(),
+}));
 vi.mock("execa", () => ({ execa: boundary.execa }));
+vi.mock("./pipe.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./pipe.js")>()),
+  // Native descriptor transfer is owned by the pipe tests; this fixture has no OS handle.
+  holdPipeForTransfer: boundary.transfer,
+}));
+vi.mock("./execa-output.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./execa-output.js")>()),
+  createExecaOutput: boundary.output,
+}));
 
 class CommandChild extends ChildProcess {
   override stdio: ChildProcess["stdio"] = [null, null, null, null, null];
@@ -44,12 +60,81 @@ function commandFixture() {
 beforeEach(() => {
   vi.useFakeTimers();
   boundary.execa.mockReset();
+  boundary.output.mockReset();
+  boundary.transfer.mockReset();
 });
 afterEach(() => {
   vi.useRealTimers();
 });
 
 describe("broker execution deadline", () => {
+  it.each(["revoked", "retired", "live"] as const)(
+    "requests final authority only after output preparation (%s)",
+    async (state) => {
+      const fixture = commandFixture();
+      const output = { receiver: new Socket(), transform: new PassThrough() };
+      const preparation = createDeferredCore<typeof output>();
+      boundary.output.mockReturnValue(preparation.promise);
+      const refusal = new Error("captured read authority revoked");
+      let current = true;
+      let active = true;
+      const prepareLaunch = vi.fn(async () => {
+        if (!current) {
+          throw refusal;
+        }
+        if (state === "retired") {
+          active = false;
+        }
+      });
+      const starting = startBrokerExeca(
+        ["synthetic-command"],
+        {
+          ...fixture.options,
+          stdout: "pipe",
+        },
+        () => {
+          if (!active) {
+            throw new Error("broker retired before native initiation");
+          }
+        },
+        prepareLaunch,
+      );
+      const outcome = starting.catch((error: unknown) => error);
+      try {
+        expect(boundary.output).toHaveBeenCalledOnce();
+        expect(prepareLaunch).not.toHaveBeenCalled();
+        expect(boundary.execa).not.toHaveBeenCalled();
+        current = state !== "revoked";
+        preparation.resolve(output);
+        if (state === "live") {
+          const command = await starting;
+          expect(boundary.execa).toHaveBeenCalledOnce();
+          expect(boundary.transfer).toHaveBeenCalledExactlyOnceWith(output.receiver);
+          fixture.completion.resolve(fixture.output);
+          expect(await command.result).toMatchObject({ failed: false, exitCode: 0 });
+          command.outputDrained(1);
+        } else {
+          expect(await outcome).toMatchObject({
+            message:
+              state === "revoked" ? refusal.message : "broker retired before native initiation",
+          });
+          expect(boundary.execa).not.toHaveBeenCalled();
+          expect(boundary.transfer).not.toHaveBeenCalled();
+          expect(output.receiver.destroyed).toBe(true);
+          expect(output.transform.destroyed).toBe(true);
+        }
+        expect(prepareLaunch).toHaveBeenCalledOnce();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        preparation.resolve(output);
+        fixture.completion.resolve(fixture.output);
+        output.receiver.destroy();
+        output.transform.destroy();
+        await outcome;
+      }
+    },
+  );
+
   it.each(["cancel", "kill", "cooperative", "signal", "exit-code", "exit-event"] as const)(
     "settles the deadline from root lifecycle state (%s)",
     async (state) => {

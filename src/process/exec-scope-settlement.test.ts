@@ -3,32 +3,46 @@ import { setImmediate } from "node:timers/promises";
 import { collectNestedErrorCandidates } from "@openclaw/normalization-core/error-coercion";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferredCore } from "../shared/deferred.js";
+import { withEffectPreparation } from "../shared/effect-authority.js";
 import { withMockedWindowsPlatform } from "../test-utils/vitest-spies.js";
 import type { CommandProcessCustody } from "./command-process-custody.types.js";
 import { CommandProcessCleanupError, hasCommandProcessCleanupError } from "./exec-result.js";
-import { runCommandWithTimeout } from "./exec-runner.js";
+import { runCommandWithTimeout, runGuardedCommandWithTimeout } from "./exec-runner.js";
 import { spawnCommand, withCommandProcessScope } from "./exec-spawn.js";
 import { runExec } from "./exec.js";
 import { BrokerChild } from "./spawn-broker/child.js";
 
-const transport = vi.hoisted(() => ({ spawn: vi.fn(), settle: vi.fn() }));
+const transport = vi.hoisted(() => ({
+  spawn: vi.fn(),
+  settle: vi.fn(),
+  prepare: vi.fn(),
+  terminate: vi.fn(),
+}));
 vi.mock("execa", () => ({ execa: transport.spawn }));
+// mock-isolation: Synthetic commands cannot inspect native executables or Windows shims.
 vi.mock("./windows-command.js", () => ({
-  resolveSafeChildProcessInvocation: ({ argv }: { argv: string[] }) => ({
-    command: argv[0],
-    args: argv.slice(1),
-    windowsHide: true,
-    windowsVerbatimArguments: false,
-    usesWindowsExitCodeShim: false,
-  }),
+  resolveSafeChildProcessInvocation: ({ argv }: { argv: string[] }) => {
+    transport.prepare();
+    return {
+      command: argv[0],
+      args: argv.slice(1),
+      windowsHide: true,
+      windowsVerbatimArguments: false,
+      usesWindowsExitCodeShim: false,
+    };
+  },
 }));
 vi.mock("../shared/pid-alive.js", () => ({
   getFileLockProcessStartTime: () => 1,
   getProcessInstanceStartTime: () => 1,
 }));
 vi.mock("./kill-tree.js", () => ({ killProcessTree: vi.fn() }));
+// mock-isolation: Synthetic child handles must never enter native process-tree termination.
 vi.mock("./exec-termination.js", () => ({
-  createCommandTerminationController: () => ({ terminate: () => false, settle: transport.settle }),
+  createCommandTerminationController: () => ({
+    terminate: transport.terminate,
+    settle: transport.settle,
+  }),
 }));
 
 const scopes: Promise<unknown>[] = [];
@@ -112,6 +126,8 @@ function commandFixture() {
 beforeEach(() => {
   transport.spawn.mockReset();
   transport.settle.mockReset();
+  transport.prepare.mockReset();
+  transport.terminate.mockReset().mockReturnValue(false);
   // Synthetic PIDs never reach the operating system.
   vi.spyOn(process, "kill").mockImplementation(() => {
     throw Object.assign(new Error("synthetic group has exited"), { code: "ESRCH" });
@@ -126,6 +142,198 @@ afterEach(async () => {
 });
 
 describe("command scope physical settlement", () => {
+  it("prepares the captured effect before command launch and refuses revoked authority", async () => {
+    const preparing = createDeferredCore();
+    const prepared = createDeferredCore();
+    const release = vi.fn();
+    const refusal = new Error("prepared effect authority retired");
+    let current = true;
+    const assertCurrent = () => {
+      if (!current) {
+        throw refusal;
+      }
+    };
+    const prepare = vi.fn(async () => {
+      preparing.resolve();
+      await prepared.promise;
+      return {
+        assertCurrent,
+        initiate: <T>(effect: () => T): T => {
+          assertCurrent();
+          return effect();
+        },
+        release,
+        persist: <T>(run: (assert: () => void) => Promise<T>): Promise<T> => run(assertCurrent),
+      };
+    });
+    const running = ownScope(() =>
+      withEffectPreparation(prepare, () =>
+        runGuardedCommandWithTimeout(["fixture"], { initiateSpawn: (launch) => launch() }),
+      ),
+    );
+    const outcome = running.catch((error: unknown) => error);
+    await preparing.promise;
+    expect(transport.spawn).not.toHaveBeenCalled();
+    current = false;
+    prepared.resolve();
+    expect(await outcome).toBe(refusal);
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledOnce();
+    expect(transport.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "refuses revoked local initiation and preserves reservation cleanup failure: %s",
+    async (cleanupFails) => {
+      const refusal = new Error("captured read authority revoked");
+      const cleanupFailure = new Error("reservation retirement failed");
+      let current = true;
+      const initiateSpawn = <T>(launch: () => T): T => {
+        if (!current) {
+          throw refusal;
+        }
+        return launch();
+      };
+      // Revoke during command preparation, after the callback has been captured.
+      transport.prepare.mockImplementationOnce(() => {
+        current = false;
+      });
+      const reservation = {
+        spawned: vi.fn(),
+        settled: vi.fn(() => {
+          if (cleanupFails) {
+            throw cleanupFailure;
+          }
+        }),
+      };
+      const error = await ownScope(
+        () => runGuardedCommandWithTimeout(["fixture"], { initiateSpawn, baseEnv: {} }),
+        { reserve: () => reservation },
+      ).catch((failure: unknown) => failure);
+      expect(transport.spawn).not.toHaveBeenCalled();
+      expect(reservation.spawned).not.toHaveBeenCalled();
+      expect(reservation.settled).toHaveBeenCalledOnce();
+      if (cleanupFails) {
+        expect(hasCommandProcessCleanupError(error)).toBe(true);
+        expect(collectNestedErrorCandidates(error)).toEqual(
+          expect.arrayContaining([refusal, cleanupFailure]),
+        );
+      } else {
+        expect(error).toBe(refusal);
+      }
+    },
+  );
+
+  it.each(["scope", "caller"] as const)(
+    "keeps %s cancellation authoritative inside a guarded local launch",
+    async (source) => {
+      const controller = new AbortController();
+      const reservation = { spawned: vi.fn(), settled: vi.fn() };
+      const result = ownScope(
+        (stop) =>
+          runGuardedCommandWithTimeout(["fixture"], {
+            signal: controller.signal,
+            initiateSpawn: (launch) => {
+              if (source === "scope") {
+                stop();
+              } else {
+                controller.abort();
+              }
+              return launch();
+            },
+          }),
+        { reserve: () => reservation },
+      );
+      await expect(result).rejects.toBeInstanceOf(Error);
+      expect(transport.spawn).not.toHaveBeenCalled();
+      expect(reservation.settled).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("requires the guarded capability and callback before native work", async () => {
+    await expect(
+      Reflect.apply(runGuardedCommandWithTimeout, undefined, [["fixture"], {}]),
+    ).rejects.toThrow("requires synchronous spawn initiation authority");
+    expect(transport.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(["caller-abort", "callback-failure"] as const)(
+    "uses the tree-termination owner and joins cleanup after %s during launch",
+    async (kind) => {
+      const fixture = commandFixture();
+      fixture.open();
+      const controller = new AbortController();
+      const failure = new Error("caller failed after launch");
+      const running = runGuardedCommandWithTimeout(["fixture"], {
+        killProcessTree: true,
+        signal: controller.signal,
+        initiateSpawn: (launch) => {
+          const child = launch();
+          if (kind === "callback-failure") {
+            throw failure;
+          }
+          controller.abort();
+          return child;
+        },
+      });
+      scopes.push(running);
+      const outcome = running.catch((error: unknown) => error);
+      expect(transport.terminate).toHaveBeenCalledOnce();
+      fixture.finish();
+      let settled = false;
+      void outcome.then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      fixture.cleanup.resolve("forced");
+      if (kind === "callback-failure") {
+        expect(await outcome).toBe(failure);
+      } else {
+        expect(await outcome).toMatchObject({ termination: "signal", cleanup: "forced" });
+      }
+    },
+  );
+
+  it.each(["ordinary", "guarded", "after-launch-failure"] as const)(
+    "retains the same local process owner for %s commands",
+    async (kind) => {
+      const fixture = commandFixture();
+      fixture.open();
+      const refusal = new Error("initiation receipt failed after native launch");
+      const initiationObserved = vi.fn();
+      const initiation = <T>(launch: () => T, settlement?: Promise<unknown>): T => {
+        initiationObserved();
+        expect(settlement).toBeUndefined();
+        const child = launch();
+        if (kind === "after-launch-failure") {
+          throw refusal;
+        }
+        return child;
+      };
+      const reservation = { spawned: vi.fn(), settled: vi.fn() };
+      const running = ownScope(
+        () =>
+          kind === "ordinary"
+            ? runCommandWithTimeout(["fixture"], {})
+            : runGuardedCommandWithTimeout(["fixture"], { initiateSpawn: initiation }),
+        { reserve: () => reservation },
+      );
+      const outcome = running.catch((error: unknown) => error);
+      fixture.finish();
+      fixture.cleanup.resolve("forced");
+      if (kind === "after-launch-failure") {
+        expect(await outcome).toBe(refusal);
+      } else {
+        expect(await running).toMatchObject({ code: 0, cleanup: "forced" });
+      }
+      expect(initiationObserved).toHaveBeenCalledTimes(kind === "ordinary" ? 0 : 1);
+      expect(transport.spawn).toHaveBeenCalledOnce();
+      expect(reservation.spawned).toHaveBeenCalledOnce();
+      expect(reservation.settled).toHaveBeenCalledOnce();
+    },
+  );
+
   it.each(["resolved", "rejected"] as const)(
     "inherits custody through native close after %s transport",
     async (result) => {

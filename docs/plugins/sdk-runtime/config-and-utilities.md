@@ -104,6 +104,34 @@ session reservation or temporary output, await `withCommandProcessScope` from th
 same subpath around execution before releasing those resources. The scope joins
 late startup and process cleanup; uncertain cleanup remains an error.
 
+Commands that read or act as soon as the process starts must use
+`runGuardedCommandWithTimeout(argv, options)` from the same subpath when their
+authority can expire during preparation. Its `GuardedCommandOptionsV1` extends
+`CommandOptions` with a required `initiateSpawn: SpawnInitiation`. Require this
+distinct export before enabling the operation on an older host; never fall back
+to `runCommandWithTimeout` or pass an optional field that an older runner can
+ignore. Brokers without guarded-command support also refuse before launching.
+
+Capture the initiating authority before any queue or asynchronous preparation.
+The guarded runner also captures and prepares the current host effect authority,
+retaining its remote settlement contract rather than exposing a mutation capability
+to the plugin. It carries the caller's exact callback to local initiation or the
+broker's final launch grant, after broker admission and output preparation. The callback must
+check current authority and synchronously return `launch()`, or throw without
+calling it. Command-scope cancellation remains an independent restriction.
+`beforeInput` is too late for startup reads, and checking only before entering
+the runner does not fence a queued broker launch.
+
+`SpawnInitiation` receives `(launch, settlement?)`. Forward the optional remote
+settlement promise to the existing authority owner: it fulfills after native
+initiation or a confirmed refusal, not merely IPC delivery or proxy failure.
+A rejected settlement must retain custody. The runner forwards settlement to its
+prepared host effect; a caller composing another authority must also forward it.
+Keep the original read assertion in the synchronous callback; the asynchronous
+`captureEffectAuthority().initiate(...)` method is not itself a `SpawnInitiation`.
+Once work has started, keep its normal cancellation and cleanup ownership; a
+later authority failure is not proof that the process never ran.
+
 For a subprocess that requires Node.js, use `resolveNodeRuntimeExecutable` from
 the same subpath. It reuses the current Node executable and resolves a real Node
 binary when the host runs under Bun, skipping Bun's `node` shim. An unavailable

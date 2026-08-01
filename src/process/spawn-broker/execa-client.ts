@@ -1,5 +1,6 @@
 import { once } from "node:events";
 import type { Options } from "execa";
+import type { SpawnInitiation } from "../spawn-initiation.js";
 import {
   restoreExecaResult,
   type BrokerExecaOptions,
@@ -114,8 +115,9 @@ export function spawnBrokerCommand(
   argv: string[],
   options: Options,
   prepared: BrokerExecaOptions,
+  initiateSpawn?: SpawnInitiation,
 ) {
-  const remote = host.spawnExeca(argv, prepared);
+  const remote = host.spawnExeca(argv, prepared, initiateSpawn);
   const child = remote.child;
   const closed = child.waitForClose();
   const onAbort = () => {

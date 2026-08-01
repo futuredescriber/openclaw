@@ -112,6 +112,7 @@ describe("iMessage message-tool artifact", () => {
     });
 
     expect(discovery?.actions).toStrictEqual([
+      "read",
       "react",
       "unsend",
       "reply",
@@ -202,7 +203,7 @@ describe("iMessage message-tool artifact", () => {
     expect(discovery?.actions).toContain("poll-vote");
   });
 
-  it("hides private actions when cached bridge status is unavailable", () => {
+  it("offers only basic history when cached bridge status is unavailable", () => {
     setCachedIMessagePrivateApiStatus("imsg", {
       available: false,
       v2Ready: false,
@@ -221,6 +222,14 @@ describe("iMessage message-tool artifact", () => {
       currentChannelId: "chat_id:1",
     });
 
-    expect(discovery?.actions).toStrictEqual([]);
+    expect(discovery?.actions).toStrictEqual(["read"]);
+  });
+
+  it.each([
+    { cfg: {}, accountId: undefined },
+    { cfg: { channels: { imessage: { enabled: false, cliPath: "imsg" } } }, accountId: undefined },
+    { cfg: { channels: { imessage: { cliPath: "imsg" } } }, accountId: "missing" },
+  ])("does not advertise reads for an unavailable account: %j", ({ cfg, accountId }) => {
+    expect(describeMessageTool({ cfg, accountId })).toBeNull();
   });
 });

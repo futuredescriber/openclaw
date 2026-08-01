@@ -134,50 +134,59 @@ function disposeFailedChild(child: ChildProcess | undefined): void {
   }
 }
 
+async function reportNotStarted(id: number, error: SpawnBrokerError): Promise<void> {
+  // This ordered failed-admission result proves that no native process was requested.
+  await report({
+    type: "execa-result",
+    id,
+    result: {
+      failed: true,
+      code: error.code,
+      timedOut: false,
+      isCanceled: false,
+      isGracefullyCanceled: false,
+      isMaxBuffer: false,
+      isTerminated: false,
+      isForcefullyTerminated: false,
+      command: "",
+      escapedCommand: "",
+      cwd: process.cwd(),
+      durationMs: 0,
+      error: serializeExecaError(error),
+    },
+  });
+  await report({
+    type: "error",
+    id,
+    error: serializeBrokerError(error),
+    resultUnavailable: true,
+  });
+}
+
 async function launch(
-  message: Extract<BrokerRequest, { type: "spawn" | "prepare-spawn" | "spawn-execa" }>,
+  message: Extract<
+    BrokerRequest,
+    {
+      type: "spawn" | "prepare-spawn" | "spawn-execa" | "prepare-spawn-execa";
+    }
+  >,
 ): Promise<void> {
   if (stopping || owned.size + starting.size + (resources?.size ?? 0) >= 256) {
-    const error = new SpawnBrokerError("Spawn broker request capacity exceeded");
-    // The ordered failed-admission result proves no native work was started.
-    // No command metadata exists because this guard precedes spawn preparation.
-    await report({
-      type: "execa-result",
-      id: message.id,
-      result: {
-        failed: true,
-        code: error.code,
-        timedOut: false,
-        isCanceled: false,
-        isGracefullyCanceled: false,
-        isMaxBuffer: false,
-        isTerminated: false,
-        isForcefullyTerminated: false,
-        command: "",
-        escapedCommand: "",
-        cwd: process.cwd(),
-        durationMs: 0,
-        error: serializeExecaError(error),
-      },
-    });
-    await report({
-      type: "error",
-      id: message.id,
-      error: serializeBrokerError(error),
-      resultUnavailable: true,
-    });
+    await reportNotStarted(
+      message.id,
+      new SpawnBrokerError("Spawn broker request capacity exceeded"),
+    );
     return;
   }
+  const isExeca = message.type === "spawn-execa" || message.type === "prepare-spawn-execa";
+  const isPrepared = message.type === "prepare-spawn" || message.type === "prepare-spawn-execa";
   const pending: { canceled?: boolean; signal?: NodeJS.Signals | number } = {};
   starting.set(message.id, pending);
   let spawnedChild: ChildProcess | undefined;
+  let nativeRequested = false;
   const assertActive = () => {
     // Ordinary queued commands still settle cancellation through their native process result.
-    if (
-      stopping ||
-      !process.connected ||
-      (message.type === "prepare-spawn" && (pending.canceled || pending.signal))
-    ) {
+    if (stopping || !process.connected || (isPrepared && (pending.canceled || pending.signal))) {
       throw new Error("Spawn broker is stopping");
     }
   };
@@ -186,26 +195,40 @@ async function launch(
     // another descriptor acknowledgement or a large buffered command result.
     const admission = await sender.reserve<Admission>(async (publish) => {
       assertActive();
-      if (message.type === "prepare-spawn") {
+      const prepareLaunch = async () => {
         const grant = createDeferredCore<boolean>();
         launchGrants.set(message.id, grant);
         try {
           await publish({ type: "prepared", id: message.id });
           if (!(await grant.promise)) {
-            throw new Error("Spawn broker launch authority refused");
+            throw new SpawnBrokerError("Spawn broker launch authority refused");
           }
           assertActive();
         } finally {
           launchGrants.delete(message.id);
         }
+      };
+      if (message.type === "prepare-spawn") {
+        await prepareLaunch();
       }
-      const execa =
-        message.type === "spawn-execa"
-          ? await startBrokerExeca(message.argv, message.options, assertActive)
-          : undefined;
+      const execa = isExeca
+        ? await startBrokerExeca(
+            message.argv,
+            message.options,
+            () => {
+              assertActive();
+              nativeRequested = true;
+            },
+            message.type === "prepare-spawn-execa" ? prepareLaunch : undefined,
+          )
+        : undefined;
+      if (!isExeca) {
+        assertActive();
+        nativeRequested = true;
+      }
       const child =
         execa?.child ??
-        (message.type !== "spawn-execa"
+        (message.type === "spawn" || message.type === "prepare-spawn"
           ? spawnWithInheritedOomScore(message.argv[0]!, message.argv.slice(1), message.options)
           : undefined);
       spawnedChild = child;
@@ -241,7 +264,7 @@ async function launch(
         child,
         detached:
           message.options.detached === true ||
-          (message.type === "spawn-execa" && message.options.killDescendants === true),
+          (isExeca && message.options.killDescendants === true),
         execa,
         announced: false,
         events: [],
@@ -380,12 +403,20 @@ async function launch(
     disposeFailedChild(spawnedChild);
     owned.delete(message.id);
     if (!stopping) {
-      await report({
-        type: "error",
-        id: message.id,
-        error: serializeBrokerError(error instanceof Error ? error : new Error(String(error))),
-        resultUnavailable: true,
-      });
+      const failure = toErrorObject(error, "Spawn broker command failed");
+      if (isPrepared && !nativeRequested) {
+        await reportNotStarted(
+          message.id,
+          new SpawnBrokerError(failure.message, { cause: failure }),
+        );
+      } else {
+        await report({
+          type: "error",
+          id: message.id,
+          error: serializeBrokerError(failure),
+          resultUnavailable: true,
+        });
+      }
     }
   } finally {
     starting.delete(message.id);
@@ -442,7 +473,8 @@ process.on("message", (raw: unknown, handle: SendHandle) => {
   if (
     message.type === "spawn" ||
     message.type === "prepare-spawn" ||
-    message.type === "spawn-execa"
+    message.type === "spawn-execa" ||
+    message.type === "prepare-spawn-execa"
   ) {
     void launch(message).catch(shutdown);
     return;
@@ -545,5 +577,5 @@ async function initialize(raw: unknown): Promise<void> {
     }
   }
   startup = "ready";
-  await report({ type: "ready", pid: process.pid });
+  await report({ type: "ready", pid: process.pid, guardedExeca: true });
 }
