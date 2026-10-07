@@ -23,7 +23,6 @@ import { getSpawnBroker } from "./spawn-broker/context.js";
 import { brokerExecaOptions, spawnBrokerCommand } from "./spawn-broker/execa-client.js";
 import type { CommandSpawnOptions, CommandSubprocess } from "./spawn-broker/execa-types.js";
 import { recordChildProcessSpawn } from "./spawn-diagnostics.js";
-import type { SpawnInitiation } from "./spawn-initiation.js";
 import { resolveSafeChildProcessInvocation } from "./windows-command.js";
 
 export const COMMAND_PROCESS_TREE_KILL_GRACE_MS = 300;
@@ -367,7 +366,6 @@ export function spawnCommandWithInvocation<
 >(
   argv: string[],
   options: OptionsType = {} as OptionsType,
-  initiateSpawn?: SpawnInitiation,
 ): {
   child: CommandSubprocess<OptionsType>;
   invocation: ReturnType<typeof resolveSafeChildProcessInvocation>;
@@ -414,48 +412,15 @@ export function spawnCommandWithInvocation<
     remoteOptions.executionDeadlineMs = executionTimeoutMs + 1_000;
   }
   const reservation = scope?.custody?.reserve([invocation.command, ...invocation.args]);
-  const initiation: SpawnInitiation | undefined = initiateSpawn
-    ? (launch, settlement) =>
-        initiateSpawn(() => {
-          if (scope?.signal.aborted) {
-            throw new Error("Command process scope is closed");
-          }
-          commandOptions.cancelSignal?.throwIfAborted();
-          return launch();
-        }, settlement)
-    : undefined;
-  let child: CommandSubprocess<CommandSpawnOptions>;
-  let nativeRequested = false;
-  try {
-    if (broker && remoteOptions) {
-      child = spawnBrokerCommand(
-        broker,
-        [invocation.command, ...invocation.args],
-        commandOptions,
-        remoteOptions,
-        initiation,
-      );
-    } else {
-      const launch = () => {
-        nativeRequested = true;
-        return execa(invocation.command, invocation.args, commandOptions);
-      };
-      child = initiation ? initiation(launch) : launch();
-    }
-  } catch (error) {
-    // A refused local launch has no child to retire its reservation. Never use
-    // this proof once native initiation could have happened.
-    if (initiation && !nativeRequested && !(broker && remoteOptions)) {
-      try {
-        reservation?.settled();
-      } catch (cleanupError) {
-        if (scope) {
-          scope.failure ??= { error: cleanupError };
-        }
-      }
-    }
-    throw error;
-  }
+  const child: CommandSubprocess<CommandSpawnOptions> =
+    broker && remoteOptions
+      ? spawnBrokerCommand(
+          broker,
+          [invocation.command, ...invocation.args],
+          commandOptions,
+          remoteOptions,
+        )
+      : execa(invocation.command, invocation.args, commandOptions);
   // nice execs Git in the same child; retain its family and operation attribution.
   const diagnosticCommand =
     argv[0] === "nice" && argv[1] === "-n" && argv[2] === "10" && argv[3] === "git"

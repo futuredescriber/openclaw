@@ -22,7 +22,12 @@ import { terminateBrokerProcessGroup, terminateLostBrokerChild } from "./cleanup
 import type { BrokerExecaOptions, BrokerExecaResult } from "./execa-protocol.js";
 import { createBrokerReceiver, createBrokerSender } from "./ipc.js";
 import { holdPipe, restoreStdinPipe } from "./pipe.js";
-import { SpawnBrokerError, type BrokerRequest, type BrokerResponse } from "./protocol.js";
+import {
+  SpawnBrokerError,
+  type BrokerRequest,
+  type BrokerResponse,
+  type BrokerSpawnOptions,
+} from "./protocol.js";
 import {
   BrokerResourceClaims,
   type BrokerNativeResourceCallbacks,
@@ -36,7 +41,6 @@ import {
   type BrokerResourceRequest,
   type BrokerResourceResponse,
 } from "./resource-protocol.js";
-import { brokerSpawnOptions } from "./spawn-options.js";
 
 export type { BrokerNativeResourceLease } from "./resource-host.js";
 
@@ -61,8 +65,6 @@ function createNativeResourceDirectory(): string {
 type Request = {
   child: BrokerChild;
   initiateSpawn?: SpawnInitiation;
-  initiationError?: Error;
-  nativeRequested: boolean;
   nativeInitiated?: ReturnType<typeof createDeferredCore<void>>;
   pid?: number;
   detached: boolean;
@@ -70,6 +72,39 @@ type Request = {
   childClosed: boolean;
   resultSettled: boolean;
 };
+
+export function brokerSpawnOptions(options: SpawnOptions): BrokerSpawnOptions | undefined {
+  const stdio = options.stdio ?? "pipe";
+  const entries = typeof stdio === "string" ? [stdio, stdio, stdio] : [...stdio];
+  const normalized: BrokerSpawnOptions["stdio"] = [];
+  for (let fd = 0; fd < Math.max(3, entries.length); fd += 1) {
+    const entry = entries[fd] ?? (fd < 3 ? "pipe" : "ignore");
+    // Only stdin is inherited by the broker. Numeric/anonymous descriptors stay host-owned.
+    if (entry === "inherit" && fd !== 0) {
+      return undefined;
+    }
+    if (entry !== "pipe" && entry !== "ignore" && entry !== "inherit" && entry !== "ipc") {
+      return undefined;
+    }
+    normalized.push(entry);
+  }
+  if (options.signal || options.timeout || options.killSignal) {
+    throw new Error("Unsupported spawn broker cancellation options");
+  }
+  return {
+    cwd: options.cwd instanceof URL ? fileURLToPath(options.cwd) : options.cwd,
+    env: options.env ? { ...options.env } : { ...process.env },
+    argv0: options.argv0,
+    detached: options.detached,
+    shell: options.shell,
+    windowsHide: options.windowsHide,
+    windowsVerbatimArguments: options.windowsVerbatimArguments,
+    serialization: options.serialization,
+    uid: options.uid,
+    gid: options.gid,
+    stdio: normalized,
+  };
+}
 
 export class SpawnBrokerHost {
   readonly entryPath: string;
@@ -79,7 +114,6 @@ export class SpawnBrokerHost {
   private sendMessage: ReturnType<typeof createBrokerSender> | undefined;
   private readiness = createDeferredCore();
   private available = false;
-  private guardedExeca = false;
   private hasBeenReady = false;
   private closing = false;
   private closePromise: Promise<void> | undefined;
@@ -239,17 +273,13 @@ export class SpawnBrokerHost {
     ).child;
   }
 
-  spawnExeca(argv: string[], options: BrokerExecaOptions, initiateSpawn?: SpawnInitiation) {
+  spawnExeca(argv: string[], options: BrokerExecaOptions) {
     const id = ++this.sequence;
-    const request = this.admit(
-      { type: initiateSpawn ? "prepare-spawn-execa" : "spawn-execa", id, argv, options },
-      initiateSpawn,
-    );
+    const request = this.admit({ type: "spawn-execa", id, argv, options });
     return {
       child: request.child,
       result: request.result!.promise,
       cancel: () => {
-        request.child.killed = true;
         void this.transmit({ type: "cancel", id }).catch((error: unknown) =>
           request.child.fail(toErrorObject(error, "Spawn broker cancellation delivery failed")),
         );
@@ -258,31 +288,26 @@ export class SpawnBrokerHost {
   }
 
   private admit(
-    message: Extract<
-      BrokerRequest,
-      {
-        type: "spawn" | "prepare-spawn" | "spawn-execa" | "prepare-spawn-execa";
-      }
-    >,
+    message: Extract<BrokerRequest, { type: "spawn" | "prepare-spawn" | "spawn-execa" }>,
     initiateSpawn?: SpawnInitiation,
   ): Request {
     const child = new BrokerChild(message.id, message.argv, (value, handle, initiate) =>
       this.transmit(value, handle, initiate),
     );
-    const isExeca = message.type === "spawn-execa" || message.type === "prepare-spawn-execa";
-    const result = isExeca ? createDeferredCore<BrokerExecaResult>() : undefined;
+    const result =
+      message.type === "spawn-execa" ? createDeferredCore<BrokerExecaResult>() : undefined;
     if (result) {
       void result.promise.catch(() => {});
     }
     const request: Request = {
       child,
       initiateSpawn,
-      nativeRequested: message.type === "spawn" || message.type === "spawn-execa",
       result,
       childClosed: false,
       resultSettled: !result,
       detached:
-        message.options.detached === true || (isExeca && message.options.killDescendants === true),
+        message.options.detached === true ||
+        (message.type === "spawn-execa" && message.options.killDescendants === true),
     };
     const fail = (error: Error) => {
       result?.reject(error);
@@ -291,19 +316,10 @@ export class SpawnBrokerHost {
     if (
       !this.available ||
       this.closing ||
-      (message.type === "prepare-spawn-execa" && !this.guardedExeca) ||
       this.requests.size + (this.resourceClaims?.size ?? 0) >= MAX_REQUESTS
     ) {
       child.markNotStarted();
-      queueMicrotask(() =>
-        fail(
-          new SpawnBrokerError(
-            message.type === "prepare-spawn-execa" && !this.guardedExeca
-              ? "Spawn broker does not support guarded Execa commands"
-              : "Spawn broker is unavailable",
-          ),
-        ),
-      );
+      queueMicrotask(() => fail(new SpawnBrokerError("Spawn broker is unavailable")));
       return request;
     }
     this.requests.set(message.id, request);
@@ -314,7 +330,7 @@ export class SpawnBrokerHost {
     });
     void this.transmit(message).catch((error: unknown) => {
       if (!request.nativeInitiated) {
-        if (message.type === "prepare-spawn" || message.type === "prepare-spawn-execa") {
+        if (message.type === "prepare-spawn") {
           child.markNotStarted();
         }
         this.requests.delete(message.id);
@@ -403,7 +419,6 @@ export class SpawnBrokerHost {
       this.markNativeReady = undefined;
       receiver.clear();
       this.available = false;
-      this.guardedExeca = false;
       this.sendMessage = undefined;
       const error = new SpawnBrokerError(
         formatChildRuntimeSpawnWarning(cause) ??
@@ -417,10 +432,6 @@ export class SpawnBrokerHost {
       void this.readiness.promise.catch(() => {});
       previousReadiness.reject(error);
       for (const request of this.requests.values()) {
-        // A prepared request cannot start without this host's final grant.
-        if (!request.nativeRequested) {
-          request.child.markNotStarted();
-        }
         if (request.pid && !request.childClosed) {
           const cleanup = terminateLostBrokerChild(
             request.pid,
@@ -500,7 +511,6 @@ export class SpawnBrokerHost {
       // SAFETY: The version-matched broker is the sole sender on this private IPC channel.
       const message = decoded as BrokerResponse | BrokerResourceResponse;
       if (message.type === "ready") {
-        this.guardedExeca = message.guardedExeca === true;
         markReady(message.pid, generation);
         return;
       }
@@ -553,25 +563,12 @@ export class SpawnBrokerHost {
           { type: "launch", id: message.id, allowed: true },
           undefined,
           (launch) => {
-            if (
-              !initiate ||
-              !nativeInitiated ||
-              request.childClosed ||
-              request.child.killed ||
-              this.closing ||
-              !this.available
-            ) {
+            if (!initiate || !nativeInitiated || request.childClosed) {
               throw new SpawnBrokerError("Spawn broker launch grant is unavailable");
             }
-            return initiate(() => {
-              request.nativeRequested = true;
-              return launch();
-            }, settlement);
+            return initiate(launch, settlement);
           },
-        ).catch((error: unknown) => {
-          if (request.result) {
-            request.initiationError = toErrorObject(error, "Command spawn initiation refused");
-          }
+        ).catch(() => {
           void this.transmit({ type: "launch", id: message.id, allowed: false }).catch(fail);
         });
       } else if (message.type === "owned") {
@@ -616,19 +613,12 @@ export class SpawnBrokerHost {
         if (request.pid === undefined && message.result.failed) {
           request.child.markNotStarted();
         }
-        if (request.initiationError) {
-          request.result?.reject(request.initiationError);
-        } else {
-          request.result?.resolve(message.result);
-        }
+        request.result?.resolve(message.result);
         request.resultSettled = true;
         this.retire(message.id, request);
       } else {
         if (message.type === "error" && message.resultUnavailable && request.result) {
-          request.result.reject(
-            request.initiationError ??
-              Object.assign(new Error(message.error.message), message.error),
-          );
+          request.result.reject(Object.assign(new Error(message.error.message), message.error));
           request.resultSettled = true;
         }
         request.child.receive(message);

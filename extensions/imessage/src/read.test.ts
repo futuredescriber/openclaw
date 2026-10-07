@@ -1,359 +1,422 @@
+import "openclaw/plugin-sdk/compiled-subprocess-testing";
 import type { ChannelMessageActionContext } from "openclaw/plugin-sdk/channel-contract";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { imessageMessageActions } from "./actions.js";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import {
+  createAgentHarnessHostCapabilitiesForTest,
+  createPluginRecord,
+  createPluginRegistry,
+  createPluginRuntimeMock,
+  createTestRegistry,
+  resetPluginRuntimeStateForTest,
+  setActivePluginRegistry,
+} from "openclaw/plugin-sdk/plugin-test-runtime";
+import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { imessagePlugin } from "./channel.js";
+import { IMessageRpcRequestError, type IMessageRpcClient } from "./client.js";
 
 const native = vi.hoisted(() => ({
-  cli: vi.fn(),
   createClient: vi.fn(),
-  request: vi.fn(),
-  stop: vi.fn(),
-  remote: vi.fn(),
+  request: vi.fn<(...args: Parameters<IMessageRpcClient["request"]>) => Promise<unknown>>(),
+  stop: vi.fn<() => Promise<void>>(),
   probe: vi.fn(),
 }));
-const authority = vi.hoisted(() => ({
-  current: true,
-}));
-
-// mock-isolation: Native process and bridge entry points must never run in this fixture.
-vi.mock("./client.js", () => ({ createIMessageRpcClient: native.createClient }));
-vi.mock("./cli-output.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./cli-output.js")>()),
-  runIMessageCliJsonCommand: native.cli,
-}));
-vi.mock("./remote-host.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./remote-host.js")>()),
-  resolveIMessageRemoteHost: native.remote,
+vi.mock("./client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./client.js")>()),
+  createIMessageRpcClient: native.createClient,
 }));
 vi.mock("./probe.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./probe.js")>()),
   probeIMessagePrivateApi: native.probe,
 }));
-vi.mock("openclaw/plugin-sdk/fetch-runtime", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("openclaw/plugin-sdk/fetch-runtime")>()),
-  captureChannelReadAuthority: () => () => {
-    if (!authority.current) {
-      throw new Error("read authority retired");
-    }
-  },
-}));
 
-const metadata = {
-  id: 42,
-  is_group: false,
-  guid: "iMessage;-;+15555550123",
-  identifier: "+15555550123",
-  participants: ["+15555550123"],
+const tempDirs = useAutoCleanupTempDirTracker(afterAll);
+const workspaceDir = tempDirs.make("imessage-read-");
+const cfg: OpenClawConfig = {
+  agents: { entries: { main: {} }, defaults: { workspace: workspaceDir } },
+  tools: { allow: ["message"], web: { search: { enabled: false }, fetch: { enabled: false } } },
+  channels: {
+    imessage: {
+      cliPath: "/synthetic/imsg-rpc",
+      dbPath: "/synthetic/messages.db",
+      dmPolicy: "disabled",
+      groupPolicy: "disabled",
+      accounts: {
+        default: {},
+        off: { enabled: false },
+        remote: {
+          cliPath: "/synthetic/imsg-ssh",
+          dbPath: "~/synthetic/messages.db",
+          remoteHost: "bot@messages-mac",
+        },
+      },
+    },
+  },
 };
-const row = {
-  id: 7,
+const row = (id = 7, text = "  decoded text\n") => ({
+  id,
   chat_id: 42,
   created_at: "2026-01-02T03:04:05Z",
   sender: "+15555550123",
   is_from_me: false,
-  text: "  decoded text\n",
-};
-const config: ChannelMessageActionContext["cfg"] = {
-  channels: {
-    imessage: {
-      cliPath: "imsg",
-      dbPath: "/synthetic/messages.db",
-      dmPolicy: "disabled",
-      groupPolicy: "disabled",
-    },
-  },
-};
+  text,
+  attachments: [{ path: "DO_NOT_EXPOSE" }],
+  guid: "DO_NOT_EXPOSE",
+});
+let metadata: unknown;
+let history: unknown;
+let run = 0;
+const hosts: Array<Awaited<ReturnType<typeof createAgentHarnessHostCapabilitiesForTest>>> = [];
 
-function read(
-  params: Record<string, unknown> = { target: "chat_id:42" },
-  context: Partial<ChannelMessageActionContext> = {},
+async function fixture(
+  options: { owner?: boolean; nativeContext?: boolean; chatType?: "direct" | "group" } = {},
 ) {
-  return imessageMessageActions.handleAction!({
-    channel: "imessage",
-    action: "read",
-    cfg: config,
-    params,
-    senderIsOwner: true,
-    conversationReadOrigin: "direct-operator",
-    ...context,
+  const owner = options.owner !== false;
+  const runId = "imessage-read-" + ++run;
+  const sessionKey = "agent:main:" + runId;
+  const context = options.nativeContext
+    ? {
+        messageChannel: "imessage",
+        agentAccountId: "default",
+        currentChannelId: "chat_id:42",
+        chatType: options.chatType ?? "direct",
+      }
+    : { messageChannel: "webchat" };
+  const host = await createAgentHarnessHostCapabilitiesForTest({
+    pluginId: "imessage-read-fixture",
+    attempt: {
+      runId,
+      sessionId: runId,
+      sessionKey,
+      agentId: "main",
+      workspaceDir,
+      config: cfg,
+      senderIsOwner: owner,
+      ...context,
+    },
+    operatorSource: {
+      profileId: owner ? "fixture-owner" : "fixture-member",
+      scopes: owner ? ["operator.admin"] : ["operator.read", "operator.write"],
+      assertCurrent: () => {},
+    },
   });
+  hosts.push(host);
+  const tools = await host.capabilities.createToolSurfaceAsync!({
+    config: cfg,
+    workspaceDir,
+    sessionKey,
+    agentId: "main",
+    senderIsOwner: owner,
+    ...context,
+    toolConstructionPlan: {
+      includeBaseCodingTools: false,
+      includeShellTools: false,
+      includeChannelTools: true,
+      includeOpenClawTools: true,
+      includePluginTools: false,
+    },
+  });
+  const message = tools.find((tool) => tool.name === "message");
+  if (!message) {
+    throw new Error("Expected the host-created message tool");
+  }
+  return {
+    host,
+    read: (params: Record<string, unknown> = {}) =>
+      message.execute("read-" + ++run, {
+        action: "read",
+        channel: "imessage",
+        target: "chat_id:42",
+        ...params,
+      }),
+  };
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
-  authority.current = true;
-  native.cli.mockReset().mockResolvedValue(metadata);
-  native.remote.mockReset().mockResolvedValue(undefined);
-  native.request.mockReset().mockResolvedValue({ messages: [row] });
+  metadata = { id: 42, is_group: false };
+  history = { messages: [row()] };
+  native.request.mockReset().mockImplementation(async (method, _params, options) => {
+    options?.assertCurrent?.();
+    if (method === "chats.get") {
+      return metadata;
+    }
+    if (method === "messages.history") {
+      return history;
+    }
+    throw new Error("Unexpected native operation: " + method);
+  });
   native.stop.mockReset().mockResolvedValue(undefined);
   native.createClient.mockReset().mockResolvedValue({ request: native.request, stop: native.stop });
+  native.probe
+    .mockReset()
+    .mockRejectedValue(new Error("Reads must not probe or launch the private bridge"));
+  const registry = createPluginRegistry({
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    runtime: createPluginRuntimeMock(),
+    activateGlobalSideEffects: false,
+  });
+  const record = createPluginRecord({
+    id: "imessage",
+    origin: "bundled",
+    trustedOfficialInstall: true,
+  });
+  registry.registry.plugins.push(record);
+  registry
+    .createApi(record, { config: cfg, registrationMode: "full" })
+    .registerChannel({ plugin: imessagePlugin });
+  setActivePluginRegistry(registry.registry);
+});
+afterEach(() => {
+  for (const host of hosts.splice(0)) {
+    host.close();
+  }
+  resetPluginRuntimeStateForTest();
 });
 
-describe("iMessage explicit DM read action", () => {
-  it("uses exact metadata then numeric history with intake disabled and no bridge probe", async () => {
-    const result = await read();
-    expect(result.details).toMatchObject({
-      chatId: 42,
-      limit: 10,
-      coverage: "recent-window",
-      historyComplete: false,
-      messages: [{ id: "7", sender: row.sender, direction: "incoming", text: row.text }],
+describe("shared message tool -> bounded native iMessage read", () => {
+  it("uses one RPC connection, preserves text, and exposes no native metadata or mutations", async () => {
+    const f = await fixture();
+    history = {
+      messages: [
+        row(),
+        { ...row(3, "newer"), created_at: "2026-01-02T03:04:06Z", is_from_me: true },
+      ],
+    };
+    const result = await f.read();
+    expect(result).toMatchObject({
+      details: {
+        chatId: 42,
+        limit: 10,
+        returned: 2,
+        coverage: "recent-window",
+        historyComplete: false,
+        messages: [
+          { id: "3", direction: "outgoing", text: "newer" },
+          {
+            id: "7",
+            timestamp: "2026-01-02T03:04:05.000Z",
+            sender: "+15555550123",
+            direction: "incoming",
+            text: "  decoded text\n",
+          },
+        ],
+      },
     });
-    expect(native.cli).toHaveBeenCalledExactlyOnceWith({
-      cliPath: "imsg",
-      dbPath: "/synthetic/messages.db",
-      timeoutMs: undefined,
-      args: ["group", "--chat-id", "42"],
-      initiateSpawn: expect.any(Function),
-    });
-    expect(native.request).toHaveBeenCalledExactlyOnceWith(
-      "messages.history",
-      { chat_id: 42, limit: 10 },
-      { timeoutMs: undefined, assertCurrent: expect.any(Function) },
-    );
+    expect(JSON.stringify(result)).not.toContain("DO_NOT_EXPOSE");
+    expect(native.request.mock.calls.map(([method, params]) => [method, params])).toEqual([
+      ["chats.get", { chat_id: 42 }],
+      ["messages.history", { chat_id: 42, limit: 10, attachments: false }],
+    ]);
+    expect(native.createClient).toHaveBeenCalledOnce();
     expect(native.stop).toHaveBeenCalledOnce();
     expect(native.probe).not.toHaveBeenCalled();
+    expect(cfg.channels?.imessage?.dmPolicy).toBe("disabled");
   });
 
-  it.each(["any", "SMS", "RCS"])(
-    "reads verified direct metadata with the native %s service",
-    async (service) => {
-      native.cli.mockResolvedValue({ ...metadata, guid: service + ";-;+15555550123" });
-      expect((await read()).details).toMatchObject({ chatId: 42, returned: 1 });
-      expect(native.request).toHaveBeenCalledOnce();
-    },
-  );
-
-  it("keeps the selected CLI, database, and remote account together", async () => {
-    native.remote.mockResolvedValue("bot@messages-mac");
-    await read(
-      { target: "chat_id:42", limit: 50 },
-      {
-        accountId: "remote",
-        cfg: {
-          channels: {
-            imessage: {
-              accounts: {
-                remote: {
-                  cliPath: "/synthetic/imsg-ssh",
-                  dbPath: "~/synthetic/messages.db",
-                  remoteHost: "bot@messages-mac",
-                  probeTimeoutMs: 1234,
-                },
-              },
-            },
-          },
-        },
-      },
-    );
-    expect(native.cli).toHaveBeenCalledWith({
-      cliPath: "/synthetic/imsg-ssh",
-      dbPath: "~/synthetic/messages.db",
-      timeoutMs: 1234,
-      args: ["group", "--chat-id", "42"],
-      initiateSpawn: expect.any(Function),
-    });
-    expect(native.createClient).toHaveBeenCalledWith({
+  it("keeps the selected remote account's transport and database together", async () => {
+    const f = await fixture();
+    await f.read({ accountId: "remote", limit: 50 });
+    expect(native.createClient).toHaveBeenCalledExactlyOnceWith({
       cliPath: "/synthetic/imsg-ssh",
       dbPath: "~/synthetic/messages.db",
       remoteHost: "bot@messages-mac",
     });
-    expect(native.request.mock.calls[0]?.[1]).toEqual({ chat_id: 42, limit: 50 });
+    expect(native.request.mock.calls[1]?.[1]).toEqual({
+      chat_id: 42,
+      limit: 50,
+      attachments: false,
+    });
   });
 
-  it("accepts trusted admin scope, not owner or scope claims in model parameters", async () => {
-    await read(undefined, { senderIsOwner: false, gatewayClientScopes: ["operator.admin"] });
-    native.cli.mockClear();
-    await expect(
-      read(
-        { target: "chat_id:42", senderIsOwner: true, gatewayClientScopes: ["operator.admin"] },
-        { senderIsOwner: false, gatewayClientScopes: ["operator.read"] },
-      ),
-    ).rejects.toThrow("requires an owner or operator.admin");
-    expect(native.cli).not.toHaveBeenCalled();
-  });
-
-  it("uses the host's canonical target, not an earlier alias", async () => {
-    await read({ target: "an earlier alias", to: "chat_id:42" });
-    expect(native.request.mock.calls[0]?.[1]).toEqual({ chat_id: 42, limit: 10 });
-  });
-
-  it("accepts the host-resolved trusted current numeric DM on the same delegated account", async () => {
-    await read(
-      { target: "chat_id:42", to: "chat_id:42" },
-      {
-        conversationReadOrigin: "delegated",
-        requesterAccountId: "default",
-        toolContext: {
-          currentChannelProvider: "imessage",
-          currentChannelId: "chat_id:42",
-          currentChatType: "direct",
-        },
+  it("preserves canonical current-DM selection and denies another native target/account", async () => {
+    const f = await fixture({ nativeContext: true });
+    await f.read({ target: undefined });
+    await f.read({ to: "chat_id:43" });
+    expect(
+      native.request.mock.calls
+        .filter(([method]) => method === "messages.history")
+        .map(([, params]) => params?.chat_id),
+    ).toEqual([42, 42]);
+    native.createClient.mockClear();
+    // The public harness above admits an operator. Exercise the native adapter
+    // contract separately with the delegated context supplied by channel ingress.
+    const context: ChannelMessageActionContext = {
+      channel: "imessage",
+      action: "read",
+      cfg,
+      senderIsOwner: true,
+      accountId: "default",
+      requesterAccountId: "default",
+      conversationReadOrigin: "delegated",
+      params: { target: "chat_id:42" },
+      toolContext: {
+        currentChannelProvider: "imessage",
+        currentChannelId: "chat_id:42",
+        currentChatType: "direct",
       },
-    );
-    expect(native.request).toHaveBeenCalledOnce();
-  });
-
-  it.each([
-    { currentChannelId: "chat_id:43", currentChatType: "direct" as const },
-    { currentChannelId: "chat_id:42", currentChatType: "group" as const },
-    { currentChannelId: "+15555550123", currentChatType: "direct" as const },
-    { currentChannelId: "chat_id:42", currentChatType: undefined },
-  ])("rejects delegated native contexts without exact current-DM proof: %j", async (current) => {
-    await expect(
-      read(undefined, {
-        conversationReadOrigin: "delegated",
-        requesterAccountId: "default",
-        toolContext: { currentChannelProvider: "imessage", ...current },
-      }),
-    ).rejects.toThrow("trusted current direct chat and account");
-    expect(native.cli).not.toHaveBeenCalled();
-  });
-
-  it.each([undefined, "another"])(
-    "rejects an unproven originating account: %j",
-    async (requesterAccountId) => {
+    };
+    for (const override of [
+      { params: { target: "chat_id:43" } },
+      { accountId: "remote" },
+      { toolContext: { ...context.toolContext, currentChatType: "group" as const } },
+    ]) {
       await expect(
-        read(undefined, {
-          conversationReadOrigin: "delegated",
-          requesterAccountId,
-          toolContext: {
-            currentChannelProvider: "imessage",
-            currentChannelId: "chat_id:42",
-            currentChatType: "direct",
-          },
-        }),
+        imessagePlugin.actions!.handleAction!({ ...context, ...override }),
       ).rejects.toThrow("trusted current direct chat and account");
-      expect(native.cli).not.toHaveBeenCalled();
-    },
-  );
+    }
+    expect(native.createClient).not.toHaveBeenCalled();
+  });
 
-  it.each([
-    { senderIsOwner: false },
-    { senderIsOwner: undefined },
-    { accountId: "missing" },
-    { cfg: {} },
-    { cfg: { channels: { imessage: { enabled: false, cliPath: "imsg" } } } },
-    {
-      accountId: "off",
-      cfg: { channels: { imessage: { accounts: { off: { enabled: false, cliPath: "imsg" } } } } },
-    },
-  ] satisfies Partial<ChannelMessageActionContext>[])(
-    "rejects unauthorized or unavailable account context before native I/O: %j",
-    async (context) => {
-      await expect(read(undefined, context)).rejects.toThrow();
-      expect(native.cli).not.toHaveBeenCalled();
-      expect(native.createClient).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each([
-    {},
-    { target: "+15555550123" },
-    { target: "name" },
-    { target: "person@example.com" },
-    { target: "chat_id:0" },
-    { target: "chat_id:-1" },
-    { target: "chat_id:1.5" },
-    { target: "chat_id:9007199254740992" },
-    { target: "chat_id:42", chatId: 43 },
-    { target: "chat_id:42", before: "7" },
-    { target: "chat_id:42", attachments: true },
-    { target: "chat_id:42", service: "sms" },
-    { target: "chat_id:42", limit: 0 },
-    { target: "chat_id:42", limit: 1.5 },
-    { target: "chat_id:42", limit: 51 },
-  ])("rejects non-numeric or unsupported normalized parameters: %j", async (params) => {
+  it("rejects spoofed authority and invalid scope/limits before native work", async () => {
+    const member = await fixture({ owner: false });
     await expect(
-      read(params, { toolContext: { currentChannelId: "chat_id:42" } }),
+      member.read({ senderIsOwner: true, gatewayClientScopes: ["operator.admin"] }),
     ).rejects.toThrow();
-    expect(native.cli).not.toHaveBeenCalled();
+    const f = await fixture();
+    for (const params of [
+      { target: undefined },
+      { target: "+15555550123" },
+      { target: "chat_id:9007199254740992" },
+      { accountId: "missing" },
+      { accountId: "off" },
+      { chatId: 43 },
+      { before: "7" },
+      { attachments: true },
+      { limit: 0 },
+      { limit: 1.5 },
+      { limit: 51 },
+    ]) {
+      await expect(f.read(params)).rejects.toThrow();
+    }
     expect(native.createClient).not.toHaveBeenCalled();
   });
 
-  it.each([
-    { id: 43 },
-    { is_group: true },
-    { is_group: undefined },
-    { is_group: "false" },
-    { participants: [] },
-    { participants: ["+15555550123", "+15555550124"] },
-    { participants: [""] },
-    { participants: ["x".repeat(100_000)] },
-    { identifier: "+15555550124" },
-    { guid: "iMessage;+;group" },
-    { guid: "iMessage;-;+15555550124" },
-    { guid: "x".repeat(100_000) },
-  ])("refuses unproven direct metadata before history (case %#)", async (override) => {
-    native.cli.mockResolvedValue({ ...metadata, ...override });
-    await expect(read()).rejects.toThrow();
-    expect(native.createClient).not.toHaveBeenCalled();
-    expect(native.request).not.toHaveBeenCalled();
-    expect(native.cli).toHaveBeenCalledOnce();
+  it("requires exact authoritative DM metadata before requesting any history", async () => {
+    const f = await fixture();
+    for (metadata of [null, {}, { id: 43, is_group: false }, { id: 42, is_group: true }]) {
+      native.request.mockClear();
+      await expect(f.read()).rejects.toThrow("one-to-one chat metadata");
+      expect(native.request.mock.calls.map(([method]) => method)).toEqual(["chats.get"]);
+    }
+    expect(native.stop).toHaveBeenCalledTimes(4);
   });
 
-  it("does not read a group-like chat explicitly configured as a group", async () => {
-    await expect(
-      read(undefined, {
-        cfg: { channels: { imessage: { cliPath: "imsg", groups: { "42": {} } } } },
-      }),
-    ).rejects.toThrow("configured group");
-    expect(native.cli).not.toHaveBeenCalled();
+  it("fails clearly on older providers and preserves native errors without fallback", async () => {
+    const f = await fixture();
+    native.request.mockRejectedValueOnce(new IMessageRpcRequestError("Unknown method", -32601));
+    await expect(f.read()).rejects.toThrow("imsg build with chats.get");
+    for (const error of [
+      new IMessageRpcRequestError("unknown chat", -32602),
+      new Error("permission denied"),
+    ]) {
+      native.request.mockRejectedValueOnce(error);
+      await expect(f.read()).rejects.toThrow(error.message);
+    }
+    expect(native.request.mock.calls.map(([method]) => method)).toEqual([
+      "chats.get",
+      "chats.get",
+      "chats.get",
+    ]);
+    expect(native.stop).toHaveBeenCalledTimes(3);
+    expect(native.probe).not.toHaveBeenCalled();
   });
 
-  it.each(["metadata", "history"])(
-    "propagates %s errors without discovery or recovery",
-    async (at) => {
-      const error = new Error("Full Disk Access denied");
-      (at === "metadata" ? native.cli : native.request).mockRejectedValueOnce(error);
-      await expect(read()).rejects.toBe(error);
-      expect(native.cli).toHaveBeenCalledOnce();
-      expect(native.probe).not.toHaveBeenCalled();
-      if (at === "metadata") {
-        expect(native.createClient).not.toHaveBeenCalled();
+  it.each(["metadata", "history", "stop", "registration"] as const)(
+    "discards data when authority retires during %s",
+    async (point) => {
+      const f = await fixture({ nativeContext: true });
+      let retired = false;
+      const retire = () => {
+        if (point === "registration") {
+          setActivePluginRegistry(createTestRegistry());
+        } else {
+          f.host.close();
+        }
+        retired = true;
+      };
+      if (point === "stop") {
+        native.stop.mockImplementationOnce(async () => retire());
       } else {
+        native.request.mockImplementation(async (method, _params, options) => {
+          options?.assertCurrent?.();
+          if ((point === "history") === (method === "messages.history")) {
+            retire();
+          }
+          return method === "chats.get" ? metadata : history;
+        });
+      }
+      await expect(f.read()).rejects.toThrow();
+      expect(retired).toBe(true);
+      expect(native.stop).toHaveBeenCalledOnce();
+      if (point === "metadata" || point === "registration") {
         expect(native.request).toHaveBeenCalledOnce();
-        expect(native.stop).toHaveBeenCalledOnce();
       }
     },
   );
 
-  it("rechecks the original read authority at queued metadata launch", async () => {
-    let nativeStarts = 0;
-    native.cli.mockImplementationOnce(async (params) => {
-      await Promise.resolve();
-      authority.current = false;
-      const launch = () => {
-        nativeStarts += 1;
-        return metadata;
+  it("bounds the complete model-visible result for Unicode and heavily escaped native rows", async () => {
+    const f = await fixture();
+    for (const text of ["a", "🚀", "\u0000", '"\\\n']) {
+      history = {
+        messages: Array.from({ length: 50 }, (_, id) => ({
+          ...row(id + 1, text.repeat(9000)),
+          sender: "猫".repeat(3000),
+        })),
       };
-      return params.initiateSpawn ? params.initiateSpawn(launch) : launch();
-    });
-    await expect(read()).rejects.toThrow("read authority retired");
-    expect(nativeStarts).toBe(0);
-    expect(native.createClient).not.toHaveBeenCalled();
-  });
-
-  it("rechecks after asynchronous transport resolution", async () => {
-    native.remote.mockImplementationOnce(async () => {
-      authority.current = false;
-      return undefined;
-    });
-    await expect(read()).rejects.toThrow("read authority retired");
-    expect(native.cli).not.toHaveBeenCalled();
-  });
-
-  it.each(["metadata", "history", "stop"])("fences authority retirement during %s", async (at) => {
-    const selected =
-      at === "metadata" ? native.cli : at === "history" ? native.request : native.stop;
-    selected.mockImplementationOnce(async () => {
-      authority.current = false;
-      return at === "metadata" ? metadata : { messages: [row] };
-    });
-    await expect(read()).rejects.toThrow("read authority retired");
-    if (at === "metadata") {
-      expect(native.createClient).not.toHaveBeenCalled();
-    } else {
-      expect(native.stop).toHaveBeenCalledOnce();
+      const result = await f.read({ limit: 50 });
+      expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(32 * 1024);
+      expect(result).toMatchObject({ details: { historyComplete: false, truncated: true } });
+      expect(result).toHaveProperty("details.messages.0.id", "50");
+      expect(result).toHaveProperty("details.messages.0.textTruncated", true);
+      expect(result).toHaveProperty("details.messages.0.senderTruncated", true);
+      const messages = asOptionalRecord(result.details)?.messages;
+      if (!Array.isArray(messages) || messages.length === 0) {
+        throw new Error("Newest text must survive truncation");
+      }
+      for (const value of messages) {
+        const message = asOptionalRecord(value);
+        if (typeof message?.text !== "string" || typeof message.sender !== "string") {
+          throw new Error("Expected text projection");
+        }
+        expect(message.text.isWellFormed()).toBe(true);
+        expect(message.text.length).toBeGreaterThan(0);
+        expect(Buffer.byteLength(message.text)).toBeLessThanOrEqual(4 * 1024);
+        expect(Buffer.byteLength(message.sender)).toBeLessThanOrEqual(256);
+      }
     }
+  });
+
+  it("reports malformed rows and empty windows without leaking foreign/group data", async () => {
+    const f = await fixture();
+    history = {
+      messages: [
+        row(1, "a\ud800b"),
+        { ...row(2), created_at: "invalid" },
+        { ...row(3), sender: {} },
+        { ...row(4), id: Number.MAX_SAFE_INTEGER + 1 },
+        { ...row(5), is_from_me: "false" },
+        { ...row(6), text: {} },
+        null,
+      ],
+    };
+    expect(await f.read()).toMatchObject({
+      details: {
+        returned: 1,
+        omittedInvalid: 6,
+        truncated: true,
+        messages: [{ text: "a�b", textTruncated: true }],
+      },
+    });
+    for (history of [
+      [],
+      { messages: [row(1), row(2)] },
+      { messages: [{ ...row(), chat_id: 43 }] },
+      { messages: [{ ...row(), is_group: true }] },
+    ]) {
+      await expect(f.read({ limit: 1 })).rejects.toThrow();
+    }
+    history = { messages: [] };
+    expect(await f.read()).toMatchObject({ details: { returned: 0, historyComplete: false } });
   });
 });

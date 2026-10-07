@@ -1,10 +1,5 @@
 // Bounded one-shot iMessage CLI execution shared by action and send surfaces.
-import {
-  runCommandWithTimeout,
-  runGuardedCommandWithTimeout,
-  type CommandOptions,
-  type SpawnInitiation,
-} from "openclaw/plugin-sdk/process-runtime";
+import { runCommandWithTimeout } from "openclaw/plugin-sdk/process-runtime";
 import { asNullableRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { expandIMessageUserPath } from "./cli-path.js";
 
@@ -31,7 +26,6 @@ export async function runIMessageCliJsonCommand(params: {
   dbPath?: string;
   args: readonly string[];
   timeoutMs?: number;
-  initiateSpawn?: SpawnInitiation;
 }): Promise<Record<string, unknown>> {
   const dbPath = params.dbPath?.trim();
   const argv = [
@@ -40,7 +34,7 @@ export async function runIMessageCliJsonCommand(params: {
     ...(dbPath ? ["--db", dbPath] : []),
     "--json",
   ];
-  const options: CommandOptions = {
+  const result = await runCommandWithTimeout(argv, {
     killProcessTree: true,
     maxOutputBytes: {
       stdout: IMESSAGE_CLI_STDOUT_MAX_BYTES,
@@ -49,10 +43,7 @@ export async function runIMessageCliJsonCommand(params: {
     outputCapture: { stdout: "head", stderr: "tail" },
     terminateOnOutputLimit: { stdout: true },
     timeoutMs: params.timeoutMs,
-  };
-  const result = params.initiateSpawn
-    ? await runGuardedCommandWithTimeout(argv, { ...options, initiateSpawn: params.initiateSpawn })
-    : await runCommandWithTimeout(argv, options);
+  });
   if (result.termination === "timeout") {
     throw new Error(`iMessage action timed out after ${params.timeoutMs}ms`);
   }

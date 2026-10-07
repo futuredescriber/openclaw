@@ -1,13 +1,7 @@
 import { ChildProcess, type MessageOptions, type SendHandle } from "node:child_process";
-import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { collectNestedErrorCandidates } from "../../infra/error-graph-internal.js";
-import {
-  captureChannelReadAuthority,
-  withChannelReadAuthority,
-} from "../../shared/channel-read-authority.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { runGuardedCommandWithTimeout } from "../exec-runner.js";
 import { spawnCommand, withCommandProcessScope } from "../exec-spawn.js";
 import { runWithSpawnBroker } from "./context.js";
 import { serializeExecaError, type BrokerExecaResult } from "./execa-protocol.js";
@@ -16,9 +10,6 @@ import { SpawnBrokerError, type BrokerResponse } from "./protocol.js";
 
 const native = vi.hoisted(() => ({
   spawn: vi.fn(),
-  execa: vi.fn(() => {
-    throw new Error("Native command execution is outside this transport fixture");
-  }),
   lostChildCleanup: vi.fn(() => ({ force: vi.fn(), settled: Promise.resolve() })),
   groupCleanup: vi.fn(() => ({ force: vi.fn(), settled: Promise.resolve() })),
 }));
@@ -27,7 +18,11 @@ vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: native.spawn,
 }));
-vi.mock("execa", () => ({ execa: native.execa }));
+vi.mock("execa", () => ({
+  execa: () => {
+    throw new Error("Native command execution is outside this transport fixture");
+  },
+}));
 vi.mock("../../infra/runtime-worker-url.js", () => ({
   resolveRuntimeWorkerUrl: () => new URL("file:///synthetic/spawn-broker.js"),
   resolveRuntimeWorkerArgv: () => ["synthetic-spawn-broker"],
@@ -78,7 +73,7 @@ afterEach(async () => {
   }
 });
 
-function brokerFixture(ready = true, guardedExeca = true) {
+function brokerFixture(ready = true) {
   // Construct the event surface only; the mocked spawn never starts this child.
   const worker = new ChildProcess();
   const requestSent = createDeferredCore<number>();
@@ -88,7 +83,6 @@ function brokerFixture(ready = true, guardedExeca = true) {
     if (!exited) {
       exited = true;
       worker.emit("exit", 0, null);
-      worker.emit("close", 0, null);
     }
   };
   const send = vi.fn(
@@ -100,9 +94,7 @@ function brokerFixture(ready = true, guardedExeca = true) {
         message &&
         typeof message === "object" &&
         "type" in message &&
-        (message.type === "spawn-execa" ||
-          message.type === "prepare-spawn-execa" ||
-          message.type === "spawn") &&
+        (message.type === "spawn-execa" || message.type === "spawn") &&
         "id" in message &&
         typeof message.id === "number"
       ) {
@@ -139,7 +131,7 @@ function brokerFixture(ready = true, guardedExeca = true) {
   send.mockClear();
   const receive = (message: BrokerResponse) => worker.emit("message", message);
   if (ready) {
-    receive({ type: "ready", pid: 41001, ...(guardedExeca ? { guardedExeca: true } : {}) });
+    receive({ type: "ready", pid: 41001 });
   }
   return { host, worker, send, receive, requestSent: requestSent.promise };
 }
@@ -188,260 +180,6 @@ const failures: FailureCase[] = [
 ];
 
 describe("broker host scope settlement", () => {
-  it.each([false, true])(
-    "rechecks captured read authority after queued preparation (revoked: %s)",
-    async (revoked) => {
-      const fixture = brokerFixture();
-      const preparation = createDeferredCore<number>();
-      const grant = createDeferredCore<{ id: number; allowed: boolean }>();
-      const blocked = createDeferredCore<() => void>();
-      const send = fixture.send.getMockImplementation()!;
-      fixture.send.mockImplementation((message, ...args) => {
-        if (
-          message &&
-          typeof message === "object" &&
-          "type" in message &&
-          "id" in message &&
-          typeof message.id === "number"
-        ) {
-          if (message.type === "prepare-spawn-execa") {
-            preparation.resolve(message.id);
-            blocked.resolve(() => {
-              args.find((arg) => typeof arg === "function")?.(null);
-            });
-            return true;
-          }
-          if (
-            message.type === "launch" &&
-            "allowed" in message &&
-            typeof message.allowed === "boolean"
-          ) {
-            grant.resolve({ id: message.id, allowed: message.allowed });
-          }
-        }
-        return send(message, ...args);
-      });
-      const refusal = new Error("captured read authority revoked");
-      let current = true;
-      let calls = 0;
-      let settlement: Promise<unknown> | undefined;
-      const command = withChannelReadAuthority(
-        () => {
-          if (!current) {
-            throw refusal;
-          }
-        },
-        async () => {
-          const assertRead = captureChannelReadAuthority()!;
-          return await runWithSpawnBroker(fixture.host, () =>
-            runGuardedCommandWithTimeout(["synthetic-command"], {
-              baseEnv: {},
-              initiateSpawn(launch, remoteSettlement) {
-                calls++;
-                settlement = remoteSettlement;
-                assertRead();
-                return launch();
-              },
-            }),
-          );
-        },
-      );
-      const outcome = command.catch((error: unknown) => error);
-      const id = await preparation.promise;
-      // The worker is prepared, but the final launch grant still waits behind
-      // the preparation's native IPC receipt on the host's existing FIFO.
-      fixture.receive({ type: "prepared", id });
-      expect(calls).toBe(0);
-      current = !revoked;
-      (await blocked.promise)();
-      expect(await grant.promise).toEqual({ id, allowed: !revoked });
-      expect(calls).toBe(1);
-      expect(settlement).toBeInstanceOf(Promise);
-      if (revoked) {
-        const refusalResult = new SpawnBrokerError("Spawn broker launch authority refused");
-        fixture.receive({
-          type: "execa-result",
-          id,
-          result: {
-            ...missingExecutableResult(),
-            code: refusalResult.code,
-            error: serializeExecaError(refusalResult),
-          },
-        });
-        fixture.receive({ type: "error", id, error: refusalResult, resultUnavailable: true });
-        expect(await outcome).toBe(refusal);
-      } else {
-        fixture.receive({ type: "owned", id, pid: 41002 });
-        await settlement;
-        fixture.receive({
-          type: "spawned",
-          id,
-          pid: 41002,
-          spawnfile: "synthetic-command",
-          spawnargs: ["synthetic-command"],
-          connected: false,
-          stdioLength: 3,
-        });
-        fixture.receive({ type: "exit", id, code: 0, signal: null });
-        fixture.receive({ type: "closed", id });
-        fixture.receive({
-          type: "execa-result",
-          id,
-          result: {
-            ...missingExecutableResult(),
-            failed: false,
-            code: undefined,
-            error: undefined,
-            exitCode: 0,
-          },
-        });
-        expect(await command).toMatchObject({ code: 0, cleanup: "normal" });
-      }
-      await settlement;
-      expect(native.execa).not.toHaveBeenCalled();
-      expect(native.spawn).toHaveBeenCalledOnce();
-    },
-  );
-
-  it("refuses an older broker without transmitting or falling back to a local command", async () => {
-    const fixture = brokerFixture(true, false);
-    const initiation = vi.fn((): never => {
-      throw new Error("Refused commands must not reach native launch authority");
-    });
-    const reservation = { spawned: vi.fn(), settled: vi.fn() };
-    const command = runWithSpawnBroker(fixture.host, () =>
-      withCommandProcessScope(
-        () => runGuardedCommandWithTimeout(["synthetic-command"], { initiateSpawn: initiation }),
-        undefined,
-        { reserve: () => reservation },
-      ),
-    );
-    await expect(command).rejects.toThrow("does not support guarded Execa commands");
-    expect(initiation).not.toHaveBeenCalled();
-    expect(fixture.send).not.toHaveBeenCalled();
-    expect(native.execa).not.toHaveBeenCalled();
-    expect(reservation.spawned).not.toHaveBeenCalled();
-    expect(reservation.settled).toHaveBeenCalledOnce();
-  });
-
-  it.each(["cancel", "retire"] as const)(
-    "refuses %s before a queued final grant without retaining unknown process custody",
-    async (state) => {
-      const fixture = brokerFixture();
-      const preparation = createDeferredCore<{ id: number; release: () => void }>();
-      const denied = createDeferredCore();
-      const send = fixture.send.getMockImplementation()!;
-      fixture.send.mockImplementation((message, ...args) => {
-        if (
-          message &&
-          typeof message === "object" &&
-          "type" in message &&
-          "id" in message &&
-          typeof message.id === "number"
-        ) {
-          if (message.type === "prepare-spawn-execa") {
-            preparation.resolve({
-              id: message.id,
-              release: () => {
-                args.find((arg) => typeof arg === "function")?.(null);
-              },
-            });
-            return true;
-          }
-          if (message.type === "launch" && "allowed" in message && message.allowed === false) {
-            denied.resolve();
-          }
-        }
-        return send(message, ...args);
-      });
-      const initiation = vi.fn((): never => {
-        throw new Error("Refused commands must not reach native launch authority");
-      });
-      const command = fixture.host.spawnExeca(
-        ["synthetic-command"],
-        { stdio: "ignore" },
-        initiation,
-      );
-      const result = command.result.catch((error: unknown) => error);
-      const { id, release } = await preparation.promise;
-      fixture.receive({ type: "prepared", id });
-      if (state === "cancel") {
-        command.cancel();
-        release();
-        await denied.promise;
-        const refusal = new SpawnBrokerError("Spawn broker launch authority refused");
-        fixture.receive({
-          type: "execa-result",
-          id,
-          result: {
-            ...missingExecutableResult(),
-            code: refusal.code,
-            error: serializeExecaError(refusal),
-          },
-        });
-        fixture.receive({ type: "error", id, error: refusal, resultUnavailable: true });
-      } else {
-        await fixture.host.close();
-        release();
-      }
-      await result;
-      await command.child.waitForClose();
-      // Drain the already-enqueued sender continuations, not a wall-clock delay.
-      await setImmediate();
-      expect(command.child.notStarted).toBe(true);
-      expect(initiation).not.toHaveBeenCalled();
-      expect(fixture.send).not.toHaveBeenCalledWith(
-        { type: "launch", id, allowed: true },
-        undefined,
-        expect.anything(),
-        expect.any(Function),
-      );
-      expect(native.execa).not.toHaveBeenCalled();
-      expect(native.lostChildCleanup).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each(["receipt", "broker-close"] as const)(
-    "retains guarded Execa native settlement after proxy failure until %s",
-    async (completion) => {
-      const fixture = brokerFixture();
-      const granted = createDeferredCore<{ settlement: Promise<unknown> }>();
-      const command = fixture.host.spawnExeca(
-        ["synthetic-command"],
-        { stdio: "ignore" },
-        (launch, settlement) => {
-          if (!settlement) {
-            throw new Error("Missing native settlement");
-          }
-          const result = launch();
-          granted.resolve({ settlement });
-          return result;
-        },
-      );
-      const result = command.result.catch((error: unknown) => error);
-      const id = await fixture.requestSent;
-      fixture.receive({ type: "prepared", id });
-      const { settlement: nativeSettlement } = await granted.promise;
-      let settled = false;
-      void nativeSettlement.then(() => {
-        settled = true;
-      });
-      command.child.fail(new Error("synthetic proxy failure"));
-      await command.child.waitForClose();
-      expect(settled).toBe(false);
-      if (completion === "receipt") {
-        fixture.receive({ type: "owned", id, pid: 41002 });
-        fixture.receive({ type: "execa-result", id, result: missingExecutableResult() });
-        expect(native.lostChildCleanup).toHaveBeenCalledOnce();
-      } else {
-        await fixture.host.close();
-      }
-      await nativeSettlement;
-      expect(settled).toBe(true);
-      await result;
-    },
-  );
-
   it.each(failures)("settles $name according to admission evidence", async (failure) => {
     const fixture = brokerFixture(!failure.local);
     let commandFailure: unknown;

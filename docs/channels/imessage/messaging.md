@@ -39,6 +39,10 @@ arguments do not grant access. This explicit read remains available with
 inbound intake. Reading does not change configuration, enable intake, subscribe
 to messages, send anything, mark messages read, or emit typing indicators.
 
+The native imsg build must advertise the read-only `chats.get` RPC method.
+Older builds are not given a shell-command fallback; update imsg and refresh channel
+status to enable this action. Metadata and history use the same RPC connection.
+
 The read uses the account's existing `cliPath`, `dbPath`, and local or SSH
 transport. It works in basic mode with Messages database access; it does not
 require the private API bridge, disabled SIP, or an `imsg launch` recovery.

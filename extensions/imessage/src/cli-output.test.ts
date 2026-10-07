@@ -1,19 +1,13 @@
-import {
-  runCommandWithTimeout,
-  runGuardedCommandWithTimeout,
-} from "openclaw/plugin-sdk/process-runtime";
+import { runCommandWithTimeout } from "openclaw/plugin-sdk/process-runtime";
 // iMessage tests cover canonical bounded CLI execution.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runIMessageCliJsonCommand } from "./cli-output.js";
 
-// mock-isolation: Command execution stays synthetic; no real process or custody starts.
 vi.mock("openclaw/plugin-sdk/process-runtime", () => ({
   runCommandWithTimeout: vi.fn(),
-  runGuardedCommandWithTimeout: vi.fn(),
 }));
 
 const runCommandMock = vi.mocked(runCommandWithTimeout);
-const runGuardedCommandMock = vi.mocked(runGuardedCommandWithTimeout);
 
 function commandResult(
   overrides: Partial<Awaited<ReturnType<typeof runCommandWithTimeout>>> = {},
@@ -32,7 +26,6 @@ function commandResult(
 describe("runIMessageCliJsonCommand", () => {
   beforeEach(() => {
     runCommandMock.mockReset();
-    runGuardedCommandMock.mockReset();
     runCommandMock.mockResolvedValue(commandResult());
   });
 
@@ -57,34 +50,6 @@ describe("runIMessageCliJsonCommand", () => {
         terminateOnOutputLimit: { stdout: true },
       }),
     );
-  });
-
-  it("retains the caller's guard through queued command preparation", async () => {
-    let current = true;
-    let nativeStarts = 0;
-    const refusal = new Error("original read authority retired");
-    runGuardedCommandMock.mockImplementationOnce(async (_argv, options) => {
-      await Promise.resolve();
-      current = false;
-      return options.initiateSpawn(() => {
-        nativeStarts += 1;
-        return commandResult();
-      });
-    });
-    await expect(
-      runIMessageCliJsonCommand({
-        cliPath: "imsg",
-        args: ["group", "--chat-id", "42"],
-        initiateSpawn: (launch) => {
-          if (!current) {
-            throw refusal;
-          }
-          return launch();
-        },
-      }),
-    ).rejects.toBe(refusal);
-    expect(nativeStarts).toBe(0);
-    expect(runCommandMock).not.toHaveBeenCalled();
   });
 
   it("parses the last JSON object after CLI noise", async () => {

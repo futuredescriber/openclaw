@@ -78,6 +78,7 @@ function bridge(selectors: Record<string, boolean> = {}) {
     available: true,
     v2Ready: true,
     selectors,
+    rpcMethods: [],
   });
 }
 function attachmentBridge(supported = true) {
@@ -85,6 +86,7 @@ function attachmentBridge(supported = true) {
     available: true,
     v2Ready: true,
     selectors: {},
+    rpcMethods: [],
     cliCapabilities: { sendRichSupportsAttachment: supported },
   });
 }

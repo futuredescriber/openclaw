@@ -127,7 +127,8 @@ unresolved SecretRef on the selected channel/account fails the action closed.
 | `member info`   | Discord, Matrix, Microsoft Teams, Slack                                                                         | `--user-id`                                                    | `--channel-id` (required for Matrix and Microsoft Teams), `--guild-id` (Discord).                                                                                                                                                                                                                      |
 
 iMessage reads require owner or admin authority and an enabled, configured account.
-They work in basic mode even when inbound DM/group intake is disabled. Results
+They require an imsg build with the `chats.get` RPC and work in basic mode even
+when inbound DM/group intake is disabled. Results
 are text-only, newest-first, bounded to 4 KiB per body and 32 KiB for the complete
 serialized provider result, and report truncation. No contact lookup, groups,
 pagination, attachments, receipts, or writes are supported. See

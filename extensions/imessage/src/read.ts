@@ -1,16 +1,11 @@
 import { jsonResult, readPositiveIntegerParam } from "openclaw/plugin-sdk/channel-actions";
 import type { ChannelMessageActionContext } from "openclaw/plugin-sdk/channel-contract";
-import {
-  captureChannelReadAuthority,
-  captureEffectAuthority,
-} from "openclaw/plugin-sdk/fetch-runtime";
-import { containsAsciiControlCharacter } from "openclaw/plugin-sdk/string-normalization-runtime";
+import { captureChannelReadAuthority } from "openclaw/plugin-sdk/fetch-runtime";
+import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { listIMessageAccountIds, resolveIMessageAccount } from "./accounts.js";
-import { runIMessageCliJsonCommand } from "./cli-output.js";
-import { createIMessageRpcClient } from "./client.js";
+import { createIMessageRpcClient, IMessageRpcRequestError } from "./client.js";
 import { projectIMessageReadResult } from "./read-result.js";
 import { resolveIMessageRemoteHost } from "./remote-host.js";
-import { normalizeIMessageHandle } from "./targets.js";
 
 const UNSUPPORTED_READ_PARAMS = [
   "chatGuid",
@@ -52,38 +47,16 @@ function readChatId(params: Record<string, unknown>): number {
   return chatId;
 }
 
-function assertDirectChat(metadata: Record<string, unknown>, chatId: number): void {
-  const { id, is_group: isGroup, guid, identifier, participants } = metadata;
-  if (
-    id !== chatId ||
-    isGroup !== false ||
-    typeof guid !== "string" ||
-    guid.length > 1024 ||
-    typeof identifier !== "string" ||
-    identifier.length > 512 ||
-    !Array.isArray(participants) ||
-    participants.length !== 1 ||
-    typeof participants[0] !== "string" ||
-    participants[0].length > 512
-  ) {
+function assertDirectChat(value: unknown, chatId: number): void {
+  const metadata = asOptionalRecord(value);
+  // The native provider owns chat classification; do not rederive it from handles.
+  if (metadata?.id !== chatId || metadata.is_group !== false) {
     throw new Error("iMessage read requires verified one-to-one chat metadata.");
-  }
-  const directHandle = /^(?:iMessage|SMS|RCS|any);-;([^;]+)$/i.exec(guid)?.[1];
-  const peer = normalizeIMessageHandle(participants[0]);
-  if (
-    !directHandle ||
-    !peer ||
-    containsAsciiControlCharacter(guid + identifier + participants[0]) ||
-    normalizeIMessageHandle(identifier) !== peer ||
-    normalizeIMessageHandle(directHandle) !== peer
-  ) {
-    throw new Error("iMessage read refused ambiguous or group chat metadata.");
   }
 }
 
 export async function readIMessageAction(context: ChannelMessageActionContext) {
   const assertReadAuthority = captureChannelReadAuthority();
-  const effect = captureEffectAuthority();
   const assertCurrent = () => {
     assertReadAuthority?.();
     context.assertDirectAdapterHandoff?.();
@@ -134,28 +107,19 @@ export async function readIMessageAction(context: ChannelMessageActionContext) {
       remoteHost: account.config.remoteHost,
     });
     assertCurrent();
-    const metadata = await effect.run(() => {
-      assertCurrent();
-      // The configured CLI may itself be the selected SSH wrapper. No chat enumeration.
-      return runIMessageCliJsonCommand({
-        cliPath,
-        dbPath,
-        timeoutMs,
-        args: ["group", "--chat-id", String(chatId)],
-        initiateSpawn: (launch) => {
-          assertCurrent();
-          return launch();
-        },
-      });
-    });
-    assertCurrent();
-    assertDirectChat(metadata, chatId);
     const client = await createIMessageRpcClient({ cliPath, dbPath, remoteHost });
     try {
       assertCurrent();
+      const metadata = await client.request(
+        "chats.get",
+        { chat_id: chatId },
+        { timeoutMs, assertCurrent },
+      );
+      assertCurrent();
+      assertDirectChat(metadata, chatId);
       const response = await client.request(
         "messages.history",
-        { chat_id: chatId, limit },
+        { chat_id: chatId, limit, attachments: false },
         { timeoutMs, assertCurrent },
       );
       assertCurrent();
@@ -167,6 +131,12 @@ export async function readIMessageAction(context: ChannelMessageActionContext) {
   } catch (error) {
     // Retirement/cancellation fences provider errors as well as successful content.
     assertCurrent();
+    if (error instanceof IMessageRpcRequestError && error.code === -32601) {
+      throw new Error(
+        "iMessage read requires an imsg build with chats.get. Update imsg on the Messages Mac and refresh channel status.",
+        { cause: error },
+      );
+    }
     throw error;
   }
 }

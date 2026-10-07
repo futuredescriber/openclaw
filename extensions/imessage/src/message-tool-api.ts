@@ -54,7 +54,9 @@ export function describeIMessageMessageTool({
     const spec = IMESSAGE_ACTIONS[action];
     // Basic history is independent of the private bridge and rich-action gates.
     if (spec.gate === null) {
-      actions.add(action);
+      if (!privateApiStatus || privateApiStatus.rpcMethods.includes("chats.get")) {
+        actions.add(action);
+      }
       continue;
     }
     if (!gate(spec.gate)) {

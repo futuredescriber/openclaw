@@ -34,7 +34,6 @@ export async function startBrokerExeca(
   argv: string[],
   options: BrokerExecaOptions,
   assertCurrent: () => void,
-  prepareLaunch?: () => Promise<void>,
 ): Promise<BrokerExecaProcess> {
   const controller = new AbortController();
   const outputs = new Map<number, { receiver: Socket; transform: Transform }>();
@@ -47,6 +46,7 @@ export async function startBrokerExeca(
         outputs.set(fd, await createExecaOutput());
       }
     }
+    assertCurrent();
     const { encoding, executionDeadlineMs, ...processOptions } = options;
     const spawnOptions = {
       ...processOptions,
@@ -64,12 +64,6 @@ export async function startBrokerExeca(
         ? execa(argv[0]!, argv.slice(1), { ...spawnOptions, encoding })
         : execa(argv[0]!, argv.slice(1), { ...spawnOptions, encoding });
     let subprocess: ReturnType<typeof start>;
-    // The final host grant follows output preparation and the worker's outbound
-    // admission. No awaited work may separate that grant from native initiation.
-    if (prepareLaunch) {
-      await prepareLaunch();
-    }
-    assertCurrent();
     try {
       subprocess = start();
     } catch (error) {

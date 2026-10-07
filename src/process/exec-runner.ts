@@ -20,11 +20,6 @@ import {
   hasChildProcessExited,
   releaseChildProcessOutputAfterExit,
 } from "./child-process.js";
-import type { CommandOptions } from "./exec-command.types.js";
-import {
-  createCommandSpawnInitiation,
-  withGuardedCommandAuthority,
-} from "./exec-guarded-initiation.js";
 import {
   appendCapturedOutput,
   appendPreservedOutputLines,
@@ -37,7 +32,11 @@ import {
   shouldTerminateOnOutput,
   type CapturedOutputBuffers,
   type CommandOutputCaptureMode,
+  type CommandOutputCaptureOption,
+  type CommandOutputErrorOption,
+  type CommandOutputLimitOption,
   type CommandOutputStream,
+  type PreserveOutputLine,
 } from "./exec-output.js";
 import {
   createSanitizedCommandError,
@@ -58,35 +57,51 @@ import {
 import { createCommandTerminationController } from "./exec-termination.js";
 import { setProcessTimeout } from "./process-deadline.js";
 import { BrokerChild } from "./spawn-broker/child.js";
-import type { SpawnInitiation } from "./spawn-initiation.js";
 
 const WINDOWS_CLOSE_STATE_SETTLE_TIMEOUT_MS = 250;
 const WINDOWS_CLOSE_STATE_POLL_MS = 10;
 
 type CommandTerminationReason = SpawnResult["termination"] | "output-limit";
 
-export type { CommandOptions } from "./exec-command.types.js";
+export type CommandOptions = {
+  timeoutMs?: number;
+  cwd?: string;
+  input?: string | Uint8Array;
+  /** Borrow a caller-owned descriptor as stdin without buffering or piping its bytes. */
+  stdinFileDescriptor?: number;
+  /** Synchronous admission with the spawned PID and argv, before input is released. */
+  beforeInput?: (pid: number, argv?: readonly string[]) => void;
+  baseEnv?: NodeJS.ProcessEnv;
+  env?: NodeJS.ProcessEnv;
+  windowsVerbatimArguments?: boolean;
+  noOutputTimeoutMs?: number;
+  signal?: AbortSignal;
+  maxOutputBytes?: number | { stdout?: number; stderr?: number };
+  maxCombinedOutputBytes?: number;
+  outputCapture?: CommandOutputCaptureOption;
+  /** Observe raw output without owning child lifecycle. Return false to stop the command. */
+  onOutputChunk?: (chunk: Buffer, stream: CommandOutputStream) => boolean | void;
+  /** Accept a successful exit when only the selected diagnostic output stream failed. */
+  tolerateOutputError?: { stdout?: boolean; stderr?: boolean };
+  /** Terminate when the selected output stream emits an error. */
+  terminateOnOutputError?: CommandOutputErrorOption;
+  terminateOnOutputLimit?: CommandOutputLimitOption;
+  maxPreservedOutputLines?: number;
+  preserveOutputLine?: PreserveOutputLine;
+  killProcessTree?: boolean;
+  /** Join owned descendants even after a successful root exits. */
+  requireProcessTreeExtinction?: boolean;
+  /** Initial signal for direct-child and graceful process-group cancellation. */
+  killSignal?: NodeJS.Signals | number;
+  /** Grace between graceful termination and the force-kill fallback. */
+  killGraceMs?: number;
+};
 
 export async function runCommandWithTimeout(
   argv: string[],
   optionsOrTimeout: number | CommandOptions,
 ): Promise<SpawnResult> {
   return await runCommandWithOutputEncoding(argv, optionsOrTimeout, false);
-}
-
-/** A guarded command requires its original authority at the native launch boundary. */
-export type GuardedCommandOptionsV1 = CommandOptions & {
-  initiateSpawn: SpawnInitiation;
-};
-
-/** Never substitute the unguarded runner when this required capability is unavailable. */
-export async function runGuardedCommandWithTimeout(
-  argv: string[],
-  options: GuardedCommandOptionsV1,
-): Promise<SpawnResult> {
-  return await withGuardedCommandAuthority(options?.initiateSpawn, (initiateSpawn) =>
-    runCommandWithOutputEncoding(argv, options, false, false, initiateSpawn),
-  );
 }
 
 /** Run a command whose stdout and stderr are defined to be UTF-8 on every platform. */
@@ -115,8 +130,6 @@ async function runCommandWithOutputEncoding(
   argv: string[],
   optionsOrTimeout: number | CommandOptions,
   forceUtf8: boolean,
-  raw?: false,
-  initiateSpawn?: SpawnInitiation,
 ): Promise<SpawnResult>;
 async function runCommandWithOutputEncoding(
   argv: string[],
@@ -129,7 +142,6 @@ async function runCommandWithOutputEncoding(
   optionsOrTimeout: number | CommandOptions,
   forceUtf8: boolean,
   raw = false,
-  initiateSpawn?: SpawnInitiation,
 ): Promise<SpawnResult | BufferSpawnResult> {
   const options: CommandOptions =
     typeof optionsOrTimeout === "number" ? { timeoutMs: optionsOrTimeout } : optionsOrTimeout;
@@ -220,46 +232,30 @@ async function runCommandWithOutputEncoding(
   let outputObserverError: unknown;
   let outputErrorStream: CommandOutputStream | undefined;
   let terminatingOutputError: Error | undefined;
-  let initiationFailure: { error: unknown } | undefined;
-  let requestInitiationCancellation = () => {
-    // Local initiation can fail before the termination owner is installed below.
-  };
-  const guardedInitiation = createCommandSpawnInitiation(
-    initiateSpawn,
-    () => signal?.throwIfAborted(),
-    (error) => {
-      initiationFailure = { error };
-      requestInitiationCancellation();
-    },
-  );
 
-  const { child, invocation } = spawnCommandWithInvocation(
-    argv,
-    {
-      buffer: false,
-      cancelSignal: cancelController.signal,
-      inheritScopeCancellation: false,
-      cwd,
-      detached: Boolean(killProcessTree && process.platform !== "win32"),
-      encoding: "buffer",
-      executionTimeoutMs: resolvedTimeoutMs,
-      baseEnv,
-      env,
-      forceKillAfterDelay: resolvedKillGraceMs,
-      killSignal,
-      ...(hasInput && !options.beforeInput ? { input } : {}),
-      reject: false,
-      stdio: [
-        // SAFETY: Execa forwards arbitrary numeric descriptors to Node; its stdin type narrows them to fd 0.
-        (options.stdinFileDescriptor as 0 | undefined) ?? (hasInput ? "pipe" : "inherit"),
-        "pipe",
-        "pipe",
-      ],
-      stripFinalNewline: false,
-      windowsVerbatimArguments: options.windowsVerbatimArguments,
-    },
-    guardedInitiation,
-  );
+  const { child, invocation } = spawnCommandWithInvocation(argv, {
+    buffer: false,
+    cancelSignal: cancelController.signal,
+    inheritScopeCancellation: false,
+    cwd,
+    detached: Boolean(killProcessTree && process.platform !== "win32"),
+    encoding: "buffer",
+    executionTimeoutMs: resolvedTimeoutMs,
+    baseEnv,
+    env,
+    forceKillAfterDelay: resolvedKillGraceMs,
+    killSignal,
+    ...(hasInput && !options.beforeInput ? { input } : {}),
+    reject: false,
+    stdio: [
+      // SAFETY: Execa forwards arbitrary numeric descriptors to Node; its stdin type narrows them to fd 0.
+      (options.stdinFileDescriptor as 0 | undefined) ?? (hasInput ? "pipe" : "inherit"),
+      "pipe",
+      "pipe",
+    ],
+    stripFinalNewline: false,
+    windowsVerbatimArguments: options.windowsVerbatimArguments,
+  });
   const startupReady = child.pid === undefined ? waitForCommandSpawn(child) : undefined;
   let waitingForSpawn = startupReady !== undefined;
   const startupCanceled = createDeferredCore<Exclude<CommandTerminationReason, "exit">>();
@@ -391,12 +387,7 @@ async function runCommandWithOutputEncoding(
       ? undefined
       : setProcessTimeout(() => cancel("timeout"), resolvedTimeoutMs);
   const onAbort = () => cancel("signal");
-  requestInitiationCancellation = onAbort;
   signal?.addEventListener("abort", onAbort, { once: true });
-  // Local initiation can throw or abort after launching but before this listener exists.
-  if (initiationFailure || signal?.aborted) {
-    onAbort();
-  }
   armNoOutputTimer();
   const clearTimers = () => {
     timeoutTimer?.clear();
@@ -415,7 +406,7 @@ async function runCommandWithOutputEncoding(
     } catch (error) {
       clearTimers();
       throw failedProcess(
-        initiationFailure?.error ?? error,
+        error,
         nodeChild instanceof BrokerChild && nodeChild.notStarted ? "normal" : "uncertain",
       );
     }
@@ -424,9 +415,6 @@ async function runCommandWithOutputEncoding(
       // The result cannot claim extinction before PID delivery. Keep the same
       // termination owner through late readiness and final output drainage.
       void processCleanup.finally(() => releaseOutput?.()).catch(() => {});
-      if (initiationFailure) {
-        throw failedProcess(initiationFailure.error);
-      }
       const stopped = {
         pid: nodeChild.pid,
         code:
@@ -611,9 +599,6 @@ async function runCommandWithOutputEncoding(
   const resolvedSignal = result.signal ?? childExitState?.signal ?? nodeChild.signalCode ?? null;
   if (cleanup === "normal" && resolvedSignal) {
     cleanup = "uncertain";
-  }
-  if (initiationFailure) {
-    throw failedProcess(initiationFailure.error, cleanup);
   }
   if (inputAdmissionError) {
     throw failedProcess(inputAdmissionError, cleanup);
